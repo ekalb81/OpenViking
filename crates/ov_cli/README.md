@@ -99,6 +99,7 @@ ov read viking://resources/...
 - `session delete` - Delete session
 - `session add-message` - Add message
 - `session commit` - Commit and extract memories
+- `session auto-commit-policy set` - Update a session's auto commit policy
 
 ### Config
 - `config show` - Show configuration
@@ -152,8 +153,10 @@ ov glob "**/*.md" --uri viking://resources
 # Session workflow
 SESSION=$(ov -o json session new | jq -r '.result.session_id')
 ov session add-message --session-id $SESSION --role user --content "Hello"
-ov session add-message --session-id $SESSION --role user --content "remember this" \
-  --auto-commit-enabled true --token-threshold 512 --idle-timeout-seconds 60 --keep-recent-count 2
+ov session add-message --session-id $SESSION --role user --content "remember this"
+# Tune the session auto commit policy (partial merge)
+ov session auto-commit-policy set $SESSION \
+  --pending-tokens 8000 --message-count 40 --idle-timeout 600 --keep-recent 10 --min-interval 60
 ov session commit --session-id $SESSION
 ```
 
