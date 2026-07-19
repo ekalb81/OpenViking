@@ -75,6 +75,35 @@ async def test_submit_doc_add_sends_controlled_payload_and_auth_headers():
 
 
 @pytest.mark.asyncio
+async def test_submit_doc_add_carries_non_tos_source_in_param_config():
+    _FakeAsyncClient.response_payload = {"code": 0, "data": {"task_key": "connector-1"}}
+    client = ConnectorClient("https://connector/doc/add", "https://tracker/task/info", "acct")
+
+    await client.submit_doc_add(
+        add_type="git",
+        api_key="secret",
+        param_config={
+            "repo_url": "https://git.example/org/repo.git",
+            "branch": "release",
+            "path_prefix": ["imports"],
+        },
+    )
+
+    payload = _FakeAsyncClient.calls[0]["json"]
+    assert payload == {
+        "add_type": "git",
+        "backend": "ov",
+        "include_child": True,
+        "param_config": {
+            "repo_url": "https://git.example/org/repo.git",
+            "branch": "release",
+            "path_prefix": ["imports"],
+        },
+    }
+    assert "tos_path" not in payload
+
+
+@pytest.mark.asyncio
 async def test_get_task_info_unwraps_task_object():
     _FakeAsyncClient.response_payload = {
         "code": 0,
