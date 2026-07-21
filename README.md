@@ -341,7 +341,7 @@ If you prefer manual configuration, create `~/.openviking/ov.conf`, remove the c
     "dense": {
       "api_base" : "<api-endpoint>",   // API endpoint address
       "api_key"  : "<your-api-key>",   // Model service API Key
-      "provider" : "<provider-type>",  // Provider type: "volcengine" or "openai" (currently supported)
+      "provider" : "<provider-type>",  // Provider type: see the supported providers below
       "dimension": 1024,               // Vector dimension
       "model"    : "<model-name>"      // Embedding model name (e.g., doubao-embedding-vision-251215 or text-embedding-3-large)
     },

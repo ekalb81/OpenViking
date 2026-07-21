@@ -119,7 +119,7 @@ OpenVikingには以下のモデル機能が必要です：
 
 ##### サポートされているVLMプロバイダー
 
-OpenVikingは3つのVLMプロバイダーをサポートしています：
+代表的なVLMプロバイダーは以下のとおりです：
 
 | プロバイダー | 説明 | APIキーの取得 |
 |----------|-------------|-------------|
@@ -209,7 +209,7 @@ OpenAIの公式APIを使用：
     "dense": {
       "api_base" : "<api-endpoint>",   // APIエンドポイントアドレス
       "api_key"  : "<your-api-key>",   // モデルサービスAPIキー
-      "provider" : "<provider-type>",  // プロバイダータイプ: "volcengine" または "openai"（現在サポート済み）
+      "provider" : "<provider-type>",  // プロバイダータイプ: 下記のサポート一覧を参照
       "dimension": 1024,               // ベクトル次元
       "model"    : "<model-name>"      // Embeddingモデル名（例：doubao-embedding-vision-251215 または text-embedding-3-large）
     },
@@ -218,9 +218,9 @@ OpenAIの公式APIを使用：
   "vlm": {
     "api_base" : "<api-endpoint>",     // APIエンドポイントアドレス
     "api_key"  : "<your-api-key>",     // モデルサービスAPIキー
-    "provider" : "<provider-type>",    // プロバイダータイプ（volcengine、openai、deepseek、anthropicなど）
+    "provider" : "<provider-type>",    // プロバイダータイプ（volcengine、openai、openai-codex、kimi、glmなど）
     "model"    : "<model-name>",       // VLMモデル名（例：doubao-seed-2-0-lite-260428 または gpt-4-vision-preview）
-    "max_concurrent": 100              // セマンティック処理の最大同時LLM呼び出し数（デフォルト: 100）
+    "max_concurrent": 64               // セマンティック処理の最大同時LLM呼び出し数（デフォルト: 64）
   }
 }
 ```
