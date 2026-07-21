@@ -1297,9 +1297,18 @@ class Session:
             )
             return
 
-        archive_messages = await self._read_archive_messages(msg.archive_uri)
+        archive_error = ""
+        try:
+            archive_messages = await self._read_archive_messages(msg.archive_uri)
+        except json.JSONDecodeError as exc:
+            archive_messages = []
+            archive_error = f"session commit archive has invalid JSON: {exc}"
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+            archive_messages = []
         if not archive_messages:
-            error = "session commit archive has no messages"
+            error = archive_error or "session commit archive has no messages"
             await self._write_failed_marker(
                 msg.archive_uri,
                 stage="archive_read",
@@ -2082,7 +2091,15 @@ class Session:
         for archive in pending_archives:
             if archive["index"] <= latest_completed_index:
                 continue
-            pending_messages.extend(await self._read_archive_messages(archive["archive_uri"]))
+            try:
+                pending_messages.extend(await self._read_archive_messages(archive["archive_uri"]))
+            except Exception as exc:
+                if not _is_storage_not_found(exc):
+                    raise
+                logger.warning(
+                    "Skipping pending archive %s because messages.jsonl is missing",
+                    archive["archive_uri"],
+                )
 
         return pending_messages
 
