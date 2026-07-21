@@ -583,7 +583,7 @@ AIエージェントのコンテキスト管理の未来を共に定義し、構
 OpenVikingプロジェクトは、コンポーネントごとに異なるライセンスを使用しています：
 
 - **メインプロジェクト**: AGPLv3 - 詳細は[LICENSE](./LICENSE)ファイルを参照してください
-- **crates/ov_cli**: Apache 2.0 - 詳細は[LICENSE](./crates/ov_cli/LICENSE)ファイルを参照してください
+- **crates/ov_cli**: Apache 2.0 - 詳細は[LICENSE](./crates/LICENSE)ファイルを参照してください
 - **examples**: Apache 2.0 - 詳細は[LICENSE](./examples/LICENSE)ファイルを参照してください
 - **third_party**: 各サードパーティプロジェクトの元のライセンス
 
