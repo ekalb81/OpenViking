@@ -112,7 +112,7 @@ async def test_add_resource_routes_tos_to_connector(
     result = await service.add_resource(
         path="tos://bucket/a/b/c",
         ctx=ctx,
-        parent="viking://resources/x/y",
+        to="viking://resources/x/y",
     )
 
     assert result == {
@@ -125,7 +125,7 @@ async def test_add_resource_routes_tos_to_connector(
         add_type="tos",
         api_key="secret",
         tos_path="bucket/a/b/c",
-        path_prefix=["x", "y"],
+        to="viking://resources/x/y",
         include_child=True,
         param_config=None,
         extra_params=None,
@@ -155,7 +155,7 @@ async def test_add_resource_routes_git_repo_to_connector(
     await service.add_resource(
         path="https://git.example/org/repo.git",
         ctx=ctx,
-        parent="viking://resources/imports",
+        to="viking://resources/imports",
         args={"branch": "release"},
     )
 
@@ -163,7 +163,7 @@ async def test_add_resource_routes_git_repo_to_connector(
         add_type="git",
         api_key="secret",
         tos_path=None,
-        path_prefix=["imports"],
+        to="viking://resources/imports",
         include_child=True,
         param_config={
             "repo_url": "https://git.example/org/repo.git",
@@ -190,7 +190,7 @@ async def test_git_connector_maps_ref_arg_to_branch(
     await service.add_resource(
         path="https://git.example/org/repo",
         ctx=ctx,
-        parent="viking://resources/imports",
+        to="viking://resources/imports",
         args={"ref": "v1.2"},
     )
 
@@ -220,7 +220,7 @@ async def test_connector_import_persists_task_before_remote_submission(
         await service.add_resource(
             path="tos://bucket/prefix",
             ctx=ctx,
-            parent="viking://resources/imports",
+            to="viking://resources/imports",
         )
 
     tracker.fail.assert_awaited_once_with(
@@ -232,16 +232,31 @@ async def test_connector_import_persists_task_before_remote_submission(
 
 
 @pytest.mark.asyncio
-async def test_connector_import_rejects_exact_to_target(
+async def test_connector_import_rejects_parent_target(
     connector_config,
     ctx,
     service,
 ):
-    with pytest.raises(InvalidArgumentError, match="exact 'to' targets"):
+    with pytest.raises(InvalidArgumentError, match="parent targets"):
+        await service.add_resource(
+            path="tos://bucket/a/b/c",
+            ctx=ctx,
+            parent="viking://resources/x/y",
+        )
+
+
+@pytest.mark.asyncio
+async def test_connector_only_source_rejects_explicit_create_parent_false(
+    connector_config,
+    ctx,
+    service,
+):
+    with pytest.raises(InvalidArgumentError, match="explicit create_parent=false"):
         await service.add_resource(
             path="tos://bucket/a/b/c",
             ctx=ctx,
             to="viking://resources/x/y",
+            create_parent=False,
         )
 
 
@@ -268,21 +283,32 @@ def test_git_route_degrades_when_disabled_or_type_not_allowed(connector_config, 
     assert service._should_use_connector("https://git.example/org/repo.git") is False
 
 
-@pytest.mark.parametrize(
-    "target",
-    [
-        {"to": "viking://resources/repo"},
-        {"parent": "viking://user/alice/resources/manuals"},
-    ],
-)
-def test_git_source_falls_back_for_unsupported_targets(
+def test_git_source_falls_back_for_parent_target(
     connector_config,
     service,
-    target,
 ):
     connector_config.allowed_add_types = ["tos", "git"]
 
-    assert service._should_use_connector("https://git.example/org/repo.git", **target) is False
+    assert (
+        service._should_use_connector(
+            "https://git.example/org/repo.git",
+            parent="viking://resources/manuals",
+        )
+        is False
+    )
+
+
+def test_git_source_falls_back_for_explicit_create_parent_false(connector_config, service):
+    connector_config.allowed_add_types = ["tos", "git"]
+
+    assert (
+        service._should_use_connector(
+            "https://git.example/org/repo.git",
+            to="viking://resources/repo",
+            kwargs={"create_parent": False},
+        )
+        is False
+    )
 
 
 def test_git_source_falls_back_for_unsupported_args(connector_config, service):
@@ -297,25 +323,45 @@ def test_git_source_falls_back_for_unsupported_args(connector_config, service):
     )
 
 
-@pytest.mark.parametrize(
-    "parent",
-    ["viking://resources/manuals", "resources/manuals"],
-)
-def test_connector_route_accepts_public_parent(connector_config, ctx, service, parent):
+@pytest.mark.parametrize("to", ["viking://resources/manuals", "resources/manuals"])
+def test_connector_route_accepts_public_exact_to(connector_config, ctx, service, to):
     connector_config.allowed_add_types = ["tos", "git"]
 
     assert (
         service._should_use_connector(
             "https://git.example/org/repo.git",
             ctx=ctx,
-            parent=parent,
+            to=to,
         )
         is True
     )
 
 
 @pytest.mark.asyncio
-async def test_add_resource_falls_back_for_shared_source_with_exact_to(
+async def test_add_resource_falls_back_for_shared_source_with_parent(
+    monkeypatch,
+    connector_config,
+    ctx,
+    service,
+):
+    connector_config.allowed_add_types = ["tos", "git"]
+    monkeypatch.setattr(resource_service_module, "is_git_repo_url", lambda _path: True)
+    service._add_resource_via_connector = AsyncMock()
+    service.enqueue_git_add_resource = AsyncMock(return_value={"root_uri": "standard-pipeline"})
+
+    result = await service.add_resource(
+        path="https://git.example/org/repo.git",
+        ctx=ctx,
+        parent="viking://resources/repo",
+    )
+
+    assert result == {"root_uri": "standard-pipeline"}
+    service._add_resource_via_connector.assert_not_awaited()
+    service.enqueue_git_add_resource.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_add_resource_falls_back_for_shared_source_with_explicit_create_parent_false(
     monkeypatch,
     connector_config,
     ctx,
@@ -330,6 +376,7 @@ async def test_add_resource_falls_back_for_shared_source_with_exact_to(
         path="https://git.example/org/repo.git",
         ctx=ctx,
         to="viking://resources/repo",
+        create_parent=False,
     )
 
     assert result == {"root_uri": "standard-pipeline"}
@@ -338,7 +385,7 @@ async def test_add_resource_falls_back_for_shared_source_with_exact_to(
 
 
 @pytest.mark.asyncio
-async def test_connector_import_without_target_keeps_resource_id_unset(
+async def test_connector_import_without_target_is_rejected(
     monkeypatch,
     connector_config,
     ctx,
@@ -350,14 +397,14 @@ async def test_connector_import_without_target_keeps_resource_id_unset(
     )
     _install_connector_dependencies(monkeypatch, tracker, connector_client)
 
-    result = await service._add_resource_via_connector(
-        path="tos://bucket/prefix",
-        ctx=ctx,
-        parent=None,
-    )
+    with pytest.raises(InvalidArgumentError, match="exact 'to' target"):
+        await service._add_resource_via_connector(
+            path="tos://bucket/prefix",
+            ctx=ctx,
+            to=None,
+        )
 
-    assert "resource_id" not in result
-    assert tracker.create.await_args.kwargs["resource_id"] is None
+    tracker.create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -370,7 +417,7 @@ async def test_connector_import_rejects_target_outside_public_resources_root(
         await service.add_resource(
             path="tos://bucket/prefix",
             ctx=ctx,
-            parent="viking://user/alice/resources/spec",
+            to="viking://user/alice/resources/spec",
         )
 
 
@@ -384,7 +431,7 @@ async def test_connector_import_rejects_unsupported_args(
         await service.add_resource(
             path="tos://bucket/prefix",
             ctx=ctx,
-            parent="viking://resources/spec",
+            to="viking://resources/spec",
             args={"parser": "pdf"},
         )
 
@@ -405,7 +452,7 @@ async def test_add_resource_accepts_reason_without_wait(
     result = await service.add_resource(
         path="tos://bucket/prefix",
         ctx=ctx,
-        parent="viking://resources/spec",
+        to="viking://resources/spec",
         reason="track quarterly reports",
     )
 
@@ -434,7 +481,7 @@ async def test_connector_import_wait_returns_terminal_result(
     result = await service.add_resource(
         path="tos://bucket/prefix",
         ctx=ctx,
-        parent="viking://resources/imports",
+        to="viking://resources/imports",
         wait=True,
     )
 
@@ -471,7 +518,7 @@ async def test_connector_import_wait_raises_on_failure(
         await service.add_resource(
             path="tos://bucket/prefix",
             ctx=ctx,
-            parent="viking://resources/imports",
+            to="viking://resources/imports",
             wait=True,
         )
 
@@ -503,7 +550,7 @@ async def test_connector_reason_links_memory_after_success(
     result = await service.add_resource(
         path="tos://bucket/prefix",
         ctx=ctx,
-        parent="viking://resources/imports",
+        to="viking://resources/imports",
         wait=True,
         reason="track quarterly reports",
     )

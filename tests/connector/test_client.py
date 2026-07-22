@@ -48,7 +48,7 @@ async def test_submit_doc_add_sends_controlled_payload_and_auth_headers():
         add_type="tos",
         api_key="secret",
         tos_path="bucket/prefix",
-        path_prefix=["docs"],
+        to="viking://resources/docs/report.pdf",
         include_child=False,
         extra_params={"parser": "pdf", "api_key": "must-not-leak"},
     )
@@ -62,7 +62,7 @@ async def test_submit_doc_add_sends_controlled_payload_and_auth_headers():
                 "backend": "ov",
                 "include_child": False,
                 "tos_path": "bucket/prefix",
-                "path_prefix": ["docs"],
+                "to": "viking://resources/docs/report.pdf",
                 "parser": "pdf",
             },
             "headers": {
@@ -82,7 +82,7 @@ async def test_submit_doc_add_carries_non_tos_source_in_param_config():
     await client.submit_doc_add(
         add_type="git",
         api_key="secret",
-        path_prefix=["imports"],
+        to="viking://resources/imports/repo",
         param_config={
             "repo_url": "https://git.example/org/repo.git",
             "branch": "release",
@@ -94,7 +94,7 @@ async def test_submit_doc_add_carries_non_tos_source_in_param_config():
         "add_type": "git",
         "backend": "ov",
         "include_child": True,
-        "path_prefix": ["imports"],
+        "to": "viking://resources/imports/repo",
         "param_config": {
             "repo_url": "https://git.example/org/repo.git",
             "branch": "release",

@@ -678,7 +678,7 @@ class ResourceService:
             return await self._add_resource_via_connector(
                 path=path,
                 ctx=ctx,
-                parent=parent,
+                to=to,
                 wait=wait,
                 reason=reason,
                 timeout=timeout,
@@ -1251,16 +1251,14 @@ class ResourceService:
         from openviking.connector.routing import CONNECTOR_SUPPORTED_ARGS
 
         unsupported: List[str] = []
-        if to:
-            unsupported.append(
-                "exact 'to' targets (Connector imports require a parent destination)"
-            )
-        if (
-            parent
-            and parent != "viking://resources"
-            and not parent.startswith("viking://resources/")
-        ):
-            unsupported.append("parent outside the public resources root (viking://resources/...)")
+        if parent:
+            unsupported.append("parent targets (Connector imports require an exact 'to' target)")
+        if not to:
+            unsupported.append("missing exact 'to' target")
+        elif to != "viking://resources" and not to.startswith("viking://resources/"):
+            unsupported.append("to outside the public resources root (viking://resources/...)")
+        if "create_parent" in kwargs and kwargs["create_parent"] is False:
+            unsupported.append("explicit create_parent=false")
         if watch_interval > 0:
             unsupported.append("watch_interval>0 (Connector imports cannot be watched yet)")
         if instruction:
@@ -1291,32 +1289,11 @@ class ResourceService:
             unsupported.append(f"args keys {unknown_args} ({supported_hint} for '{add_type}')")
         return unsupported
 
-    @staticmethod
-    def _connector_path_prefix(target_uri: Optional[str]) -> Optional[List[str]]:
-        """Map the resolved parent target onto the Connector's path_prefix.
-
-        Connector plugins compose final URIs as
-        viking://resources/<path_prefix>/<source path>/<doc name>, so only
-        parent targets under the public resources root can be honored.
-        """
-        if not target_uri:
-            return None
-        root = "viking://resources"
-        if target_uri == root:
-            return None
-        if not target_uri.startswith(root + "/"):
-            raise InvalidArgumentError(
-                "Connector imports can only target the public resources root "
-                f"(viking://resources/...), got '{target_uri}'."
-            )
-        segments = [seg for seg in target_uri[len(root) + 1 :].split("/") if seg]
-        return segments or None
-
     async def _add_resource_via_connector(
         self,
         path: str,
         ctx: RequestContext,
-        parent: Optional[str],
+        to: Optional[str],
         wait: bool = False,
         reason: str = "",
         timeout: Optional[float] = None,
@@ -1343,11 +1320,12 @@ class ResourceService:
         target = ContentTargetSpec.from_fields(
             ctx=ctx,
             kind="resource",
-            parent=parent,
+            to=to,
             create_parent=bool(kwargs.get("create_parent", False)),
         )
-        task_resource_id = target.parent or None
-        path_prefix = self._connector_path_prefix(task_resource_id)
+        if not target.to:
+            raise InvalidArgumentError("Connector import requires an exact 'to' target.")
+        task_resource_id = target.to
 
         forwarded_args = {
             key: value
@@ -1365,8 +1343,8 @@ class ResourceService:
                 )
             tos_path = source_path
         elif add_type == "git":
-            # Source-specific settings stay in param_config; path_prefix is a
-            # connector-wide top-level field for every plugin type.
+            # Source-specific settings stay in param_config. The exact target
+            # is transported separately as the top-level ``to`` field.
             param_config = {"repo_url": path.strip()}
             branch = forwarded_args.get("branch") or forwarded_args.get("ref")
             if branch:
@@ -1392,7 +1370,7 @@ class ResourceService:
                 add_type=add_type,
                 api_key=ctx.api_key,
                 tos_path=tos_path,
-                path_prefix=path_prefix,
+                to=task_resource_id,
                 include_child=True,
                 param_config=param_config,
                 extra_params=None,
