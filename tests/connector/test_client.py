@@ -82,10 +82,10 @@ async def test_submit_doc_add_carries_non_tos_source_in_param_config():
     await client.submit_doc_add(
         add_type="git",
         api_key="secret",
+        path_prefix=["imports"],
         param_config={
             "repo_url": "https://git.example/org/repo.git",
             "branch": "release",
-            "path_prefix": ["imports"],
         },
     )
 
@@ -94,10 +94,10 @@ async def test_submit_doc_add_carries_non_tos_source_in_param_config():
         "add_type": "git",
         "backend": "ov",
         "include_child": True,
+        "path_prefix": ["imports"],
         "param_config": {
             "repo_url": "https://git.example/org/repo.git",
             "branch": "release",
-            "path_prefix": ["imports"],
         },
     }
     assert "tos_path" not in payload

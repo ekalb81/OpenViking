@@ -163,12 +163,11 @@ async def test_add_resource_routes_git_repo_to_connector(
         add_type="git",
         api_key="secret",
         tos_path=None,
-        path_prefix=None,
+        path_prefix=["imports"],
         include_child=True,
         param_config={
             "repo_url": "https://git.example/org/repo.git",
             "branch": "release",
-            "path_prefix": ["imports"],
         },
         extra_params=None,
     )

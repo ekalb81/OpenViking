@@ -1365,15 +1365,12 @@ class ResourceService:
                 )
             tos_path = source_path
         elif add_type == "git":
-            # Non-TOS plugins read only param_config; forwarded args keep the
-            # semantics the standard pipeline's accessor gives them
-            # (branch/ref both select the branch to sync).
+            # Source-specific settings stay in param_config; path_prefix is a
+            # connector-wide top-level field for every plugin type.
             param_config = {"repo_url": path.strip()}
             branch = forwarded_args.get("branch") or forwarded_args.get("ref")
             if branch:
                 param_config["branch"] = str(branch)
-            if path_prefix:
-                param_config["path_prefix"] = path_prefix
         else:  # pragma: no cover - detection only yields tos/git today
             raise InvalidArgumentError(f"Connector add_type '{add_type}' is not supported.")
 
@@ -1395,7 +1392,7 @@ class ResourceService:
                 add_type=add_type,
                 api_key=ctx.api_key,
                 tos_path=tos_path,
-                path_prefix=path_prefix if add_type == "tos" else None,
+                path_prefix=path_prefix,
                 include_child=True,
                 param_config=param_config,
                 extra_params=None,

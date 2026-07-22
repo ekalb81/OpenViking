@@ -67,10 +67,8 @@ class ConnectorClient:
     ) -> Dict[str, Any]:
         """Submit a document import job via the configured doc/add endpoint.
 
-        TOS imports address the source with the top-level ``tos_path`` /
-        ``path_prefix`` fields; every other source type carries its
-        configuration inside ``param_config``, which the Connector forwards
-        verbatim to the plugin.
+        ``path_prefix`` is a connector-wide top-level field for every source
+        type. Source-specific settings stay inside ``param_config``.
 
         Returns the Connector response dict (contains task key / id on success).
         """
