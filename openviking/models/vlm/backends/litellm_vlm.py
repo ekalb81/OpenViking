@@ -99,11 +99,15 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 
 # Ollama defaults to a 4096-token context window and silently truncates any
-# longer prompt to fit. OV prompts (memory extraction is ~5k+ tokens) overflow
-# it, so the model never sees the real input and returns empty/garbage with no
-# error. Default to a larger window for Ollama models; callers can override via
-# ``extra_request_body["num_ctx"]``.
-OLLAMA_DEFAULT_NUM_CTX = 16384
+# longer prompt to fit. OV prompts overflow it, so the model never sees the
+# real input and returns empty/garbage with no error. Note the memory
+# extraction prompt alone is now ~15-18k tokens (operations JSON schema for
+# ~10 memory types + prefetched context) before any transcript is added, so
+# the previous 16384 default reproduced the same silent-truncation failure:
+# models lose the system prompt, invent field names, and every extracted item
+# is dropped by validation. Default to a window that comfortably fits schema +
+# transcript chunks; callers can override via ``extra_request_body["num_ctx"]``.
+OLLAMA_DEFAULT_NUM_CTX = 65536
 
 # LiteLLM routes that address a local Ollama server.
 OLLAMA_LITELLM_PREFIXES: tuple[str, ...] = ("ollama/", "ollama_chat/")

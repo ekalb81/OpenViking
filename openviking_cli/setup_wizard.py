@@ -875,7 +875,7 @@ def _ollama_vlm_config(vlm: VLMPreset) -> dict[str, Any]:
         "api_base": "http://localhost:11434",
         "temperature": 0.0,
         "max_retries": 2,
-        "extra_request_body": {"num_ctx": 16384, "think": False},
+        "extra_request_body": {"num_ctx": 65536, "think": False},
     }
 
 
