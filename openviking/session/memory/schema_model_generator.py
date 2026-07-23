@@ -121,10 +121,15 @@ class SchemaModelGenerator:
                 ),
             )
 
+        # page_id is optional: local/small models frequently omit it even when the
+        # schema requires it, and a required field means every such item is silently
+        # dropped by parse_json_with_stability's per-item validation — extraction
+        # then "succeeds" with zero operations. Items without page_id fall back to
+        # schema-derived URIs in resolve_operations, so None is safe.
         field_definitions["page_id"] = (
-            Annotated[int, WithJsonSchema({"type": "integer"})],
+            Annotated[Optional[int], WithJsonSchema({"type": "integer"})],
             Field(
-                ...,
+                None,
                 description="Temporary page_id for identifying the target memory item.",
             ),
         )
