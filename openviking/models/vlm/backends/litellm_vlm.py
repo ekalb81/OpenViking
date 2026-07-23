@@ -304,6 +304,42 @@ class LiteLLMVLMProvider(VLMBase):
         if self.extra_request_body:
             kwargs["extra_body"] = dict(self.extra_request_body)
 
+        # Enable OpenRouter prompt caching by marking the system message (the
+        # large static prefix: extraction schema, instructions) as an
+        # Anthropic-style cache breakpoint. OpenRouter translates cache_control
+        # for providers with explicit caching (e.g. Alibaba/Qwen: cache reads
+        # are ~10x cheaper than input); providers without it ignore the marker.
+        if _has_litellm_prefix(model, ("openrouter/",)):
+            _marked_msgs = []
+            _cache_marked = False
+            for _m in kwargs["messages"]:
+                if not _cache_marked and isinstance(_m, dict) and _m.get("role") == "system":
+                    _c = _m.get("content")
+                    if isinstance(_c, str) and _c:
+                        _m = {
+                            **_m,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": _c,
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        }
+                        _cache_marked = True
+                    elif (
+                        isinstance(_c, list)
+                        and _c
+                        and isinstance(_c[-1], dict)
+                        and _c[-1].get("type") == "text"
+                    ):
+                        _parts = [dict(_p) for _p in _c]
+                        _parts[-1]["cache_control"] = {"type": "ephemeral"}
+                        _m = {**_m, "content": _parts}
+                        _cache_marked = True
+                _marked_msgs.append(_m)
+            kwargs["messages"] = _marked_msgs
+
         # Ollama-specific request options. Without an explicit num_ctx the server
         # truncates long prompts to its 4096-token default; thinking models left
         # in thinking mode emit only reasoning and stall on CPU. Set safe
