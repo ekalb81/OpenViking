@@ -86,7 +86,9 @@ class IngestOrchestrator:
                         await self.replayer.reset_session(name, ref)
                     else:
                         await self.replayer.reconcile(name, ref)
-                added = await self._backfill_one(name, source, ref, dry_run=dry_run)
+                added = await self._backfill_one(
+                    name, source, ref, dry_run=dry_run, commit_cfg=harness_cfg.commit
+                )
                 stats.sessions += 1
                 stats.messages += added
                 if not dry_run:
@@ -101,7 +103,7 @@ class IngestOrchestrator:
                 stats.errors.append(f"{name}/{ref.native_session_id}: {exc}")
         return stats
 
-    async def _backfill_one(self, name, source, ref, *, dry_run: bool) -> int:
+    async def _backfill_one(self, name, source, ref, *, dry_run: bool, commit_cfg=None) -> int:
         cursor = self.store.get_cursor(name, ref.native_session_id, source.cursor_kind)
         total = 0
         while True:
@@ -121,6 +123,16 @@ class IngestOrchestrator:
                 total += await self.replayer.append_batch(
                     name, ref, messages, from_cursor, new_cursor
                 )
+                # Honor commit_token_threshold during backfill, mirroring watch mode
+                # (poller.py). Without this, backfill commits a session exactly once
+                # at the end, and a session larger than the VLM context window sends
+                # one oversized extraction request that fails permanently (e.g. a
+                # 1.1M-token session vs a 1M-token model). Chunked commits keep every
+                # extraction request bounded regardless of session size.
+                if commit_cfg is not None:
+                    await self.replayer.maybe_commit_on_threshold(
+                        name, ref, commit_cfg.commit_token_threshold, commit_cfg.keep_recent_count
+                    )
             cursor = new_cursor
         return total
 
