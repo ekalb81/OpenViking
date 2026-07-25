@@ -23,6 +23,26 @@ from openviking.session.train import (
     PolicyUpdatePlan,
 )
 
+VALID_EXPERIENCE_CONTENT = """## Situation
+- A booking workflow risks creating a duplicate.
+
+## Approach
+- Check for an existing booking before creating another.
+
+## Reflect
+- NEVER create a duplicate when the existing booking satisfies the request.
+"""
+
+EXISTING_EXPERIENCE_CONTENT = """## Situation
+- A booking workflow may already contain a matching reservation.
+
+## Approach
+- Compare the requested booking with the existing reservation.
+
+## Reflect
+- ALWAYS preserve a matching reservation instead of creating a duplicate.
+"""
+
 
 class FakeVikingFS:
     def __init__(self, files: dict[str, str]):
@@ -47,7 +67,10 @@ class FakeVikingFS:
     async def read_file(self, uri: str, ctx=None):
         return self.files[uri]
 
-    async def write_file(self, uri: str, content: str, ctx=None, lock_handle=None):
+    async def write_file(self, uri: str, content: str, ctx=None, lock_handle=None, **kwargs):
+        # lock_handle is asserted on by the transaction tests; **kwargs keeps the
+        # fake tolerant of writer kwargs it does not care about.
+        del kwargs
         self.write_lock_handles.append((uri, lock_handle))
         self.files[uri] = content
 
@@ -76,7 +99,7 @@ def _experience_set() -> ExperienceSet:
                 uri="viking://user/u/memories/experiences/booking_duplicate_handling.md",
                 version=1,
                 status="production",
-                content="content",
+                content=EXISTING_EXPERIENCE_CONTENT,
             )
         ],
     )
@@ -126,14 +149,18 @@ def _patch_gradient(
         after_file=_memory_file(name=name, uri=uri, content=after, version=base_version),
         base_version=base_version,
         rationale=rationale,
-        links=links or [
-            StoredLink(
-                from_uri=uri or "",
-                to_uri="viking://user/u/memories/trajectories/traj1.md",
-                link_type="derived_from",
-                weight=1.0,
-            )
-        ],
+        links=(
+            links
+            if links is not None
+            else [
+                StoredLink(
+                    from_uri=uri or "",
+                    to_uri="viking://user/u/memories/trajectories/traj1.md",
+                    link_type="derived_from",
+                    weight=1.0,
+                )
+            ]
+        ),
         confidence=confidence,
         metadata=metadata or {},
     )
@@ -166,7 +193,9 @@ def _plan_item_from_gradient(gradient: PatchSemanticGradient):
     )
 
 
-def _delete_plan(*, uri: str, before_content: str = "content") -> PolicyUpdatePlan:
+def _delete_plan(
+    *, uri: str, before_content: str = EXISTING_EXPERIENCE_CONTENT
+) -> PolicyUpdatePlan:
     from openviking.session.train import PolicyPlanItem
 
     return PolicyUpdatePlan(
@@ -258,13 +287,17 @@ async def test_dry_run_policy_updater_does_not_mutate_policy_set():
 @pytest.mark.asyncio
 async def test_dry_run_policy_updater_simulates_patch_plan_items():
     policy_set = _experience_set()
-    gradient = _patch_gradient(uri=policy_set.policies[0].uri, before="content", after="new content")
+    gradient = _patch_gradient(
+        uri=policy_set.policies[0].uri,
+        before=EXISTING_EXPERIENCE_CONTENT,
+        after=VALID_EXPERIENCE_CONTENT,
+    )
     plan = _plan_from_gradient(gradient)
 
     result = await DryRunPolicyUpdater().apply(plan, policy_set)
 
     assert result.updated_policy_set is not policy_set
-    assert result.updated_policy_set.policies[0].content == "new content"
+    assert result.updated_policy_set.policies[0].content == VALID_EXPERIENCE_CONTENT
     assert result.updated_policy_set.policies[0].version == 2
     assert result.written_uris == []
     assert result.metadata["dry_run"] is True
@@ -272,16 +305,16 @@ async def test_dry_run_policy_updater_simulates_patch_plan_items():
 
 
 @pytest.mark.asyncio
-async def test_dry_run_policy_updater_simulates_delete_plan_items():
+async def test_dry_run_policy_updater_rejects_unmapped_experience_delete():
     policy_set = _experience_set()
     plan = _delete_plan(uri=policy_set.policies[0].uri)
 
     result = await DryRunPolicyUpdater().apply(plan, policy_set)
 
-    assert result.updated_policy_set is not policy_set
-    assert result.updated_policy_set.policies == []
+    assert result.updated_policy_set is policy_set
     assert result.written_uris == []
     assert result.deleted_uris == []
+    assert result.errors == ["automatic experience delete is disabled: booking_duplicate_handling"]
     assert result.metadata["dry_run"] is True
     assert result.metadata["simulated"] is True
 
@@ -289,8 +322,24 @@ async def test_dry_run_policy_updater_simulates_delete_plan_items():
 @pytest.mark.asyncio
 async def test_memory_file_policy_updater_writes_experience_files():
     policy_set = _experience_set()
-    fs = FakeVikingFS({})
-    gradient = _patch_gradient(uri=policy_set.policies[0].uri, before="content", after="new content")
+    uri = policy_set.policies[0].uri
+    fs = FakeVikingFS(
+        {
+            uri: MemoryFileUtils.write(
+                _memory_file(
+                    name=policy_set.policies[0].name,
+                    uri=uri,
+                    content=EXISTING_EXPERIENCE_CONTENT,
+                )
+            )
+        }
+    )
+    gradient = _patch_gradient(
+        uri=uri,
+        before=EXISTING_EXPERIENCE_CONTENT,
+        after=VALID_EXPERIENCE_CONTENT,
+        links=[],
+    )
     plan = _plan_from_gradient(gradient)
 
     result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(
@@ -302,7 +351,7 @@ async def test_memory_file_policy_updater_writes_experience_files():
     assert result.errors == []
     assert result.written_uris == [policy_set.policies[0].uri]
     written = fs.files[policy_set.policies[0].uri]
-    assert written.startswith("new content")
+    assert written.startswith(VALID_EXPERIENCE_CONTENT)
     assert '"memory_type": "experiences"' in written
     assert '"experience_name": "booking_duplicate_handling"' in written
     assert '"version": 2' in written
@@ -335,9 +384,25 @@ async def test_memory_file_policy_updater_reuses_transaction_lock_for_experience
 @pytest.mark.asyncio
 async def test_memory_file_policy_updater_vectorizes_written_experience_files():
     policy_set = _experience_set()
-    fs = FakeVikingFS({})
+    uri = policy_set.policies[0].uri
+    fs = FakeVikingFS(
+        {
+            uri: MemoryFileUtils.write(
+                _memory_file(
+                    name=policy_set.policies[0].name,
+                    uri=uri,
+                    content=EXISTING_EXPERIENCE_CONTENT,
+                )
+            )
+        }
+    )
     vikingdb = FakeVikingDB()
-    gradient = _patch_gradient(uri=policy_set.policies[0].uri, before="content", after="new content")
+    gradient = _patch_gradient(
+        uri=uri,
+        before=EXISTING_EXPERIENCE_CONTENT,
+        after=VALID_EXPERIENCE_CONTENT,
+        links=[],
+    )
     plan = _plan_from_gradient(gradient)
 
     from openviking.server.identity import RequestContext, Role
@@ -355,7 +420,7 @@ async def test_memory_file_policy_updater_vectorizes_written_experience_files():
     embedding_msg = vikingdb.embedding_messages[0]
     assert embedding_msg.context_data["uri"] == policy_set.policies[0].uri
     assert embedding_msg.context_data["context_type"] == "memory"
-    assert "new content" in embedding_msg.message
+    assert embedding_msg.message == VALID_EXPERIENCE_CONTENT.strip()
 
 
 @pytest.mark.asyncio
@@ -365,6 +430,13 @@ async def test_memory_file_policy_updater_writes_v2_compatible_source_trajectory
     traj_uri = "viking://user/u/memories/trajectories/booking_duplicate.md"
     fs = FakeVikingFS(
         {
+            exp_uri: MemoryFileUtils.write(
+                _memory_file(
+                    name=policy_set.policies[0].name,
+                    uri=exp_uri,
+                    content=EXISTING_EXPERIENCE_CONTENT,
+                )
+            ),
             traj_uri: MemoryFileUtils.write(
                 MemoryFile(
                     uri=traj_uri,
@@ -380,8 +452,8 @@ async def test_memory_file_policy_updater_writes_v2_compatible_source_trajectory
     )
     gradient = _patch_gradient(
         uri=exp_uri,
-        before="content",
-        after="new content",
+        before=EXISTING_EXPERIENCE_CONTENT,
+        after=VALID_EXPERIENCE_CONTENT,
         links=[
             StoredLink(
                 from_uri=exp_uri,
@@ -393,7 +465,11 @@ async def test_memory_file_policy_updater_writes_v2_compatible_source_trajectory
     )
     plan = _plan_from_gradient(gradient)
 
-    result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(plan, policy_set)
+    result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(
+        plan,
+        policy_set,
+        fake_request_context(),
+    )
 
     assert result.errors == []
     exp_mf = MemoryFileUtils.read(fs.files[exp_uri], uri=exp_uri)
@@ -418,7 +494,29 @@ async def test_memory_file_policy_updater_writes_v2_compatible_source_trajectory
 
 
 @pytest.mark.asyncio
-async def test_memory_file_policy_updater_deletes_experience_files():
+async def test_dry_run_and_real_updater_both_reject_invalid_experience_content():
+    policy_set = _experience_set()
+    plan = _plan_from_gradient(
+        _patch_gradient(
+            uri=policy_set.policies[0].uri,
+            before=EXISTING_EXPERIENCE_CONTENT,
+            after="unstructured content",
+        )
+    )
+    fs = FakeVikingFS({})
+
+    dry_run = await DryRunPolicyUpdater().apply(plan, policy_set)
+    applied = await MemoryFilePolicyUpdater(viking_fs=fs).apply(plan, policy_set)
+
+    assert dry_run.errors
+    assert applied.errors
+    assert dry_run.updated_policy_set is policy_set
+    assert applied.updated_policy_set is policy_set
+    assert fs.files == {}
+
+
+@pytest.mark.asyncio
+async def test_memory_file_policy_updater_rejects_unmapped_experience_delete():
     policy_set = _experience_set()
     uri = policy_set.policies[0].uri
     fs = FakeVikingFS({uri: "content"})
@@ -431,12 +529,12 @@ async def test_memory_file_policy_updater_deletes_experience_files():
         transaction_handle=lock_handle,
     )
 
-    assert result.errors == []
+    assert result.errors == ["automatic experience delete is disabled: booking_duplicate_handling"]
     assert result.written_uris == []
-    assert result.deleted_uris == [uri]
-    assert result.updated_policy_set.policies == []
-    assert uri not in fs.files
-    assert fs.rm_lock_handles == [lock_handle]
+    assert result.deleted_uris == []
+    assert result.updated_policy_set is policy_set
+    assert uri in fs.files
+    assert fs.rm_lock_handles == []
 
 
 @pytest.mark.asyncio

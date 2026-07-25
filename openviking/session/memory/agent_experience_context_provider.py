@@ -72,20 +72,21 @@ For each distinct user intent in the trajectory, output a SEPARATE experience en
 
 Each entry:
 - `experience_name`: the name of the experience (new or existing)
-- `content`: the full experience content (rewrite holistically, incorporating old + new)
-- `supersedes`: the `experience_name` of an older experience this one replaces — set ONLY when the new name is genuinely different and broader. Leave empty otherwise.
+- `content`: the complete replacement body. Retain only rules that remain relevant to the exact same user intent and tool sequence; do not accumulate adjacent lessons.
+- `supersedes`: always the empty string (`""`). This field is reserved for explicit administrative migrations outside automated extraction.
 
 The system handles create vs update automatically:
 - Same `experience_name` as an existing one → updates it in place
 - New `experience_name` → creates a new experience
-- `supersedes` set → old experience is deleted and its history is inherited
 
 ## Rules
 
 - **One experience per distinct user intent.** If a trajectory covers N different user goals (e.g., cancel + modify + add baggage), output N separate entries — never merge them into one.
 - **Split over merge.** When in doubt whether two patterns belong together, split them. Only merge with an existing experience when it covers the EXACT same user intent and tool sequence.
 - **Consistent naming language.** All `experience_name` values in one output must use the same language.
-- **Do NOT use `delete_ids`** for experience operations — use `supersedes` instead.
+- **No automated deletion or supersession.** Keep `delete_ids` empty, do not emit `replacement_page_id`, and set every `supersedes` value to `""`.
+- **Do not copy a candidate wholesale.** Update only when its user intent and tool sequence are the same.
+- **Grandfather legacy entries.** If a candidate violates the current structure or size limits, do not update, delete, replace, rename, or supersede it automatically. Create bounded new entries and leave the legacy source unchanged for an explicit, separately verified administrative migration.
 - Follow field descriptions in the schema.
 - Output JSON only. Do not call any tools.
 
@@ -270,9 +271,9 @@ All memory content must be written in {output_language}.
                     [
                         "You have already read the conversation, one `new_trajectory`, candidate experience memories, and optional `candidate_source_trajectory` references.",
                         "Treat `new_trajectory` as the new execution to incorporate.",
-                        "Treat `candidate_experience` as existing memories you may update, replace, or skip.",
+                        "Treat `candidate_experience` as existing memories you may update in place only for the exact same intent and tool sequence, or skip. Never delete, replace, rename, or supersede it.",
                         "Treat `candidate_source_trajectory` as reference-only context for understanding a candidate experience; do not modify it directly.",
-                        "Based on the above, decide whether to **Update**, **Replace**, **Create**, or **Skip**. Output JSON only.",
+                        'Based on the above, decide whether to **Update**, **Create**, or **Skip**. Keep `delete_ids` empty and every `supersedes` value equal to `""`. Output JSON only.',
                         "A single trajectory covering multiple user intents MUST produce multiple entries.",
                     ]
                 ),

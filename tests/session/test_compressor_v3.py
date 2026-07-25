@@ -11,7 +11,11 @@ import pytest
 from openviking.message import Message, TextPart
 from openviking.server.identity import RequestContext, Role
 from openviking.session import create_session_compressor
-from openviking.session.compressor_v3 import SessionCompressorV3, _experience_root_uri
+from openviking.session.compressor_v3 import (
+    SessionCompressorV3,
+    _case_training_links,
+    _experience_root_uri,
+)
 from openviking.session.memory.dataclass import (
     MemoryFile,
     ResolvedOperation,
@@ -176,6 +180,274 @@ def test_case_experience_links_exclude_experiences_that_failed_to_persist():
     )
 
 
+@pytest.mark.parametrize(
+    ("errors", "mark_written"),
+    [
+        ([], False),
+        (["experience update rejected"], False),
+        (["link publication failed"], True),
+    ],
+)
+def test_case_training_links_exclude_unapplied_planned_experience(errors, mark_written):
+    """Same guarantee as above, but through the public entry point.
+
+    _case_training_links merges trajectory links with experience links; this
+    pins that a planned-but-unapplied experience never reaches the merged
+    result, whichever way the apply failed.
+    """
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    exp_uri = "viking://user/u/memories/experiences/experience.md"
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=False,
+            score=0.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="failure",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="experience",
+                target_uri=exp_uri,
+                before_content=None,
+                after_content="planned experience content",
+                links=[
+                    StoredLink(
+                        from_uri=exp_uri,
+                        to_uri=traj_uri,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            )
+        ]
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+        written_uris=[exp_uri] if mark_written else [],
+        errors=errors,
+    )
+
+    links = _case_training_links(
+        analysis=analysis,
+        case_uri=case_uri,
+        plan=plan,
+        apply_result=apply_result,
+    )
+
+    assert [(link.to_uri, link.link_type) for link in links] == [
+        (traj_uri, "related_to")
+    ]
+
+
+
+@pytest.mark.asyncio
+async def test_case_training_link_target_write_failure_rolls_back_every_endpoint():
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    case_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=case_uri,
+            content="# case",
+            memory_type="cases",
+            extra_fields={
+                "memory_type": "cases",
+                "case_name": "case",
+                "task_signature": "Complete one bounded task.",
+                "input": '{"summary":"bounded task","preconditions":[]}',
+                "rubric": (
+                    '{"name":"case","description":"complete the task",'
+                    '"criteria":[{"name":"complete","description":"task completed",'
+                    '"required":true,"weight":1.0}]}'
+                ),
+                "evidence": "The rollout contains an observable result.",
+            },
+        )
+    )
+    trajectory_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=traj_uri,
+            content="trajectory content",
+            memory_type="trajectories",
+            extra_fields={
+                "memory_type": "trajectories",
+                "trajectory_name": "trajectory",
+            },
+        )
+    )
+
+    class FailTargetWriteOnceFS:
+        def __init__(self):
+            self.files = {
+                case_uri: case_original,
+                traj_uri: trajectory_original,
+            }
+            self.write_attempts = []
+            self.target_write_failed = False
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None):
+            del ctx
+            self.write_attempts.append(uri)
+            if uri == traj_uri and not self.target_write_failed:
+                self.target_write_failed = True
+                raise OSError("injected trajectory backlink write failure")
+            self.files[uri] = content
+
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=True,
+            score=1.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="success",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+    )
+    fs = FailTargetWriteOnceFS()
+    compressor = object.__new__(SessionCompressorV3)
+
+    with pytest.raises(RuntimeError, match="Failed to write link endpoint"):
+        await compressor._link_case_to_training_outputs(
+            analysis=analysis,
+            case_uri=case_uri,
+            plan=PolicyUpdatePlan(items=[]),
+            apply_result=apply_result,
+            ctx=_ctx(),
+            viking_fs=fs,
+        )
+
+    assert fs.files == {
+        case_uri: case_original,
+        traj_uri: trajectory_original,
+    }
+    assert fs.write_attempts == [case_uri, traj_uri, traj_uri, case_uri]
+
+
+@pytest.mark.asyncio
+async def test_case_training_link_silent_case_write_never_publishes_target_backlink():
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    case_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=case_uri,
+            content="# case",
+            memory_type="cases",
+            extra_fields={
+                "memory_type": "cases",
+                "case_name": "case",
+                "task_signature": "Complete one bounded task.",
+                "input": '{"summary":"bounded task","preconditions":[]}',
+                "rubric": (
+                    '{"name":"case","description":"complete the task",'
+                    '"criteria":[{"name":"complete","description":"task completed",'
+                    '"required":true,"weight":1.0}]}'
+                ),
+                "evidence": "The rollout contains an observable result.",
+            },
+        )
+    )
+    trajectory_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=traj_uri,
+            content="trajectory content",
+            memory_type="trajectories",
+            extra_fields={
+                "memory_type": "trajectories",
+                "trajectory_name": "trajectory",
+            },
+        )
+    )
+
+    class IgnoreFirstCaseWriteFS:
+        def __init__(self):
+            self.files = {case_uri: case_original, traj_uri: trajectory_original}
+            self.write_attempts = []
+            self.ignored = False
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None):
+            del ctx
+            self.write_attempts.append(uri)
+            if uri == case_uri and not self.ignored:
+                self.ignored = True
+                return
+            self.files[uri] = content
+
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=True,
+            score=1.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="success",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    fs = IgnoreFirstCaseWriteFS()
+    compressor = object.__new__(SessionCompressorV3)
+
+    with pytest.raises(RuntimeError, match="Case endpoint readback did not match"):
+        await compressor._link_case_to_training_outputs(
+            analysis=analysis,
+            case_uri=case_uri,
+            plan=PolicyUpdatePlan(items=[]),
+            apply_result=PolicyApplyResult(
+                updated_policy_set=ExperienceSet(
+                    root_uri="viking://user/u/memories/experiences",
+                    policies=[],
+                ),
+            ),
+            ctx=_ctx(),
+            viking_fs=fs,
+        )
+
+    assert fs.files == {case_uri: case_original, traj_uri: trajectory_original}
+    assert fs.write_attempts == [case_uri, case_uri]
+
+
 @pytest.mark.asyncio
 async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch):
     submitted_gradients = []
@@ -282,6 +554,149 @@ async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch)
     assert submitted_analyses[0] is not None
     assert submitted_analyses[0].trajectories[0].name == "duplicate_booking"
     assert cases[0].name == "duplicate_booking"
+
+
+@pytest.mark.asyncio
+async def test_failed_experience_apply_is_not_committed_summarized_or_counted(monkeypatch):
+    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
+    traj_uri = "viking://user/u/memories/trajectories/t1.md"
+    exp_uri = "viking://user/u/memories/experiences/e1.md"
+    submitted_gradients = []
+
+    class FakeFS:
+        def __init__(self):
+            self.commits = []
+            self.read_uris = []
+
+        async def ls(self, uri, output="original", ctx=None):
+            del uri, output, ctx
+            return []
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            self.read_uris.append(uri)
+            raise AssertionError(f"failed apply URI must not be read for summary: {uri}")
+
+        async def commit(self, **kwargs):
+            self.commits.append(kwargs)
+
+    class FakeTrainer:
+        policy_set = ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        )
+
+        async def submit_gradients(self, gradients, *, analysis=None, rollout=None):
+            del rollout
+            submitted_gradients.append(list(gradients))
+            plan = PolicyUpdatePlan(
+                items=[
+                    PolicyPlanItem(
+                        kind="upsert",
+                        memory_type="experiences",
+                        target_name="e1",
+                        target_uri=exp_uri,
+                        before_content=None,
+                        after_content="new experience",
+                        links=[
+                            StoredLink(
+                                from_uri=exp_uri,
+                                to_uri=traj_uri,
+                                link_type="derived_from",
+                                weight=1.0,
+                            )
+                        ],
+                    )
+                ]
+            )
+            return RolloutTrainingResult(
+                analyses=[analysis] if analysis else [],
+                gradients=list(gradients),
+                plan=plan,
+                apply_result=PolicyApplyResult(
+                    updated_policy_set=self.policy_set,
+                    written_uris=[exp_uri],
+                    errors=["injected relation publication failure"],
+                ),
+                metadata={},
+            )
+
+    class FakeAnalyzer:
+        async def analyze(self, rollout, context):
+            del rollout, context
+            return RolloutAnalysis(
+                evaluation=RubricEvaluation(
+                    passed=True,
+                    score=1.0,
+                    criterion_results=[],
+                    feedback=[],
+                ),
+                trajectories=[
+                    Trajectory(
+                        name="duplicate_booking",
+                        uri=traj_uri,
+                        content="trajectory content",
+                        outcome="success",
+                        retrieval_anchor="",
+                    )
+                ],
+                gradients=[],
+            )
+
+    async def fake_estimate_exp_gradients(self, *args, **kwargs):
+        from openviking.session.train import PatchSemanticGradient
+
+        return [
+            PatchSemanticGradient(
+                before_file=None,
+                after_file=MemoryFile(
+                    uri=exp_uri,
+                    content="new experience",
+                    memory_type="experiences",
+                    extra_fields={"experience_name": "e1"},
+                ),
+                base_version=None,
+                rationale="test",
+                links=[],
+                confidence=0.9,
+                metadata={},
+            )
+        ]
+
+    fs = FakeFS()
+    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_streaming_policy_trainer",
+        AsyncMock(return_value=FakeTrainer()),
+    )
+    monkeypatch.setattr(
+        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
+        fake_estimate_exp_gradients,
+    )
+
+    result = await SessionCompressorV3(
+        vikingdb=None,
+        rollout_analyzer=FakeAnalyzer(),
+    ).train_from_extracted_cases(
+        cases=[_training_case()],
+        messages=_messages(),
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri=archive_uri,
+        collect_memory_diff=True,
+    )
+
+    assert submitted_gradients
+    assert result["submitted"] == 0
+    assert fs.commits == []
+    assert fs.read_uris == []
+    assert result["memory_diff"]["operations"]["adds"] == [
+        {
+            "uri": traj_uri,
+            "memory_type": "trajectories",
+            "after": "trajectory content",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -962,6 +1377,19 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
     traj_uri = "viking://user/u/memories/trajectories/duplicate_booking.md"
     exp_uri = "viking://user/u/memories/experiences/booking_duplicate_handling.md"
     deleted_exp_uri = "viking://user/u/memories/experiences/legacy_booking_handling.md"
+    old_exp_content = """## Situation
+- A duplicate booking must be handled without canceling the wrong reservation.
+
+## Approach
+- Inspect the confirmed booking identifiers before taking action.
+
+## Reflect
+- NEVER infer which booking is the duplicate without verification.
+"""
+    new_exp_content = old_exp_content.replace(
+        "Inspect the confirmed booking identifiers",
+        "Verify the confirmed booking identifiers",
+    )
 
     class FakeFS:
         def __init__(self):
@@ -1009,7 +1437,7 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                 exp_uri: MemoryFileUtils.write(
                     MemoryFile(
                         uri=exp_uri,
-                        content="old exp content",
+                        content=new_exp_content,
                         memory_type="experiences",
                         extra_fields={
                             "memory_type": "experiences",
@@ -1046,8 +1474,8 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                         memory_type="experiences",
                         target_name="booking_duplicate_handling",
                         target_uri=exp_uri,
-                        before_content="old exp content",
-                        after_content="new exp content",
+                        before_content=old_exp_content,
+                        after_content=new_exp_content,
                         links=[
                             StoredLink(
                                 from_uri=exp_uri,
@@ -1104,7 +1532,7 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                 before_file=None,
                 after_file=MemoryFile(
                     uri=exp_uri,
-                    content="new exp content",
+                    content=new_exp_content,
                     memory_type="experiences",
                     extra_fields={"experience_name": "booking_duplicate_handling"},
                 ),

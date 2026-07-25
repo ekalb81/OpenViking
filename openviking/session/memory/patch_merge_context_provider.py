@@ -130,6 +130,24 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
 
     def instruction(self) -> str:
         output_language = self._output_language
+        if self.memory_type.casefold() == "experiences":
+            return f"""You are an experience patch reconciliation agent.
+
+You are given original experience files and structured experience-file field diffs. Produce final additive or exact in-place update operations that follow the provided JSON schema.
+
+Do not call tools. Output JSON only.
+
+All memory content must be written in {output_language}.
+
+Keep distinct experiences separate. Update an existing experience only when the
+proposal covers the exact same user intent and tool sequence and the existing
+file already satisfies the current experience policy. Otherwise create a
+separate bounded experience and leave every existing or legacy file unchanged.
+Keep `delete_ids` empty, never emit `replacement_page_id`, and set every
+`supersedes` value to the empty string. Do not delete, replace, rename, combine,
+or supersede an existing or legacy experience. Existing URI and filename fields
+are stable identities; do not normalize them into a different target.
+"""
         return f"""You are a memory patch merge agent.
 
 You are given original memory files and structured memory-file field diffs. Merge them by producing final memory operations that follow the provided JSON schema.

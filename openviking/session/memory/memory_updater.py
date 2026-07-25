@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 
+from openviking.core.namespace import canonical_user_root, canonicalize_uri
 from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
@@ -24,6 +25,12 @@ from openviking.session.memory.dataclass import (
     ResolvedOperation,
     ResolvedOperations,
     StoredLink,
+)
+from openviking.session.memory.experience_policy import (
+    uri_targets_experience_store,
+    validate_experience_operation_context,
+    validate_experience_operations,
+    validate_stored_experience,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op import MergeOpFactory
@@ -71,11 +78,43 @@ class ChunkMeta:
     chunk_count: int
 
 
+class _LinkPublicationError(RuntimeError):
+    """A link batch could not be published as one consistent graph update."""
+
+    def __init__(
+        self,
+        failed_uri: str,
+        phase: str,
+        cause: Exception,
+        rollback_failures: Optional[List[Tuple[str, Exception]]] = None,
+    ) -> None:
+        self.failed_uri = failed_uri
+        self.phase = phase
+        self.rollback_failures = list(rollback_failures or [])
+        message = f"Failed to {phase} link endpoint {failed_uri}: {cause}"
+        if phase == "write":
+            if self.rollback_failures:
+                rollback_uris = ", ".join(uri for uri, _ in self.rollback_failures)
+                message += f"; rollback also failed for: {rollback_uris}"
+            else:
+                message += "; attempted endpoint writes were rolled back"
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    """Exact pre-publication state for one canonical filesystem object."""
+
+    existed: bool
+    content: Any = None
+
+
 async def write_stored_links(
     links: List[StoredLink],
     ctx: RequestContext,
     viking_fs: Any,
     skip_uris: Optional[set] = None,
+    preserve_version_uris: Optional[set] = None,
     lock_handle: Any = None,
 ) -> List[str]:
     """Write StoredLinks to their endpoint files' links/backlinks fields.
@@ -84,14 +123,52 @@ async def write_stored_links(
     to_uri's ``backlinks`` receives the reverse reference.
     Files listed in skip_uris are skipped (caller handles them in the same write).
     When lock_handle is provided, all endpoint rewrites reuse that transaction.
-    Returns the endpoint URIs that were successfully rewritten.  Callers can
-    use this to avoid reporting link-only edits for files that failed the
-    read/modify/write step.
+    All endpoints are read and rendered before the first write. If a later
+    endpoint write fails, every attempted endpoint is restored from its
+    pre-publication content using the same lock handle. This compensation is
+    best-effort rather than a true cross-file transaction: a rollback write can
+    itself fail, and callers without a lock remain exposed to concurrent writes.
+
+    Returns all endpoint URIs only after the full batch succeeds. Raises
+    ``_LinkPublicationError`` on preflight or publication failure.
     """
     from openviking.session.memory.merge_op.link_merge import merge_links
 
     skip = skip_uris or set()
+    preserve_versions = preserve_version_uris or set()
     lock_kwargs = {"lock_handle": lock_handle} if lock_handle is not None else {}
+    endpoint_content: Dict[str, Any] = {}
+    experience_endpoints = list(
+        dict.fromkeys(
+            uri
+            for link in links
+            for uri in (link.from_uri, link.to_uri)
+            if uri_targets_experience_store(uri)
+        )
+    )
+    for uri in experience_endpoints:
+        try:
+            canonical_uri = canonicalize_uri(uri, ctx)
+            expected_root = f"{canonical_user_root(ctx)}/memories/experiences"
+            if not canonical_uri.startswith(f"{expected_root}/"):
+                raise ValueError(
+                    "Experience link endpoint must belong to the authenticated user's "
+                    "canonical experience store"
+                )
+            content = await viking_fs.read_file(uri, ctx=ctx)
+            if not content:
+                raise ValueError("experience endpoint content is empty")
+            memory_file = MemoryFileUtils.read(content, uri=uri)
+            stored_errors = validate_stored_experience(memory_file, uri)
+            if stored_errors:
+                raise ValueError(
+                    "Experience link endpoint is legacy-invalid and read-only: "
+                    + repr([error["code"] for error in stored_errors])
+                )
+            endpoint_content[uri] = content
+        except Exception as e:
+            raise _LinkPublicationError(uri, "prepare", e) from e
+
     file_links: Dict[str, Dict[str, List[StoredLink]]] = {}
     for link in links:
         if link.from_uri not in skip:
@@ -101,12 +178,14 @@ async def write_stored_links(
             file_links.setdefault(link.to_uri, {"links": [], "backlinks": []})
             file_links[link.to_uri]["backlinks"].append(link)
 
-    updated_uris: List[str] = []
+    prepared_writes: List[Tuple[str, Any, str]] = []
     for uri, link_groups in file_links.items():
         try:
-            content = await viking_fs.read_file(uri, ctx=ctx)
+            content = endpoint_content.get(uri)
+            if content is None:
+                content = await viking_fs.read_file(uri, ctx=ctx)
             if not content:
-                continue
+                raise ValueError("endpoint content is empty")
             mf = MemoryFileUtils.read(content, uri=uri)
             if link_groups["links"]:
                 mf.links = merge_links(mf.links, [l.model_dump() for l in link_groups["links"]])
@@ -117,17 +196,48 @@ async def write_stored_links(
             current_trace_id = get_trace_id()
             if current_trace_id:
                 mf.extra_fields["last_update_trace_id"] = current_trace_id
-            bump_memory_version(mf)
+            if uri not in preserve_versions:
+                bump_memory_version(mf)
+            prepared_writes.append((uri, content, MemoryFileUtils.write(mf)))
+        except Exception as e:
+            raise _LinkPublicationError(uri, "prepare", e) from e
+
+    attempted_writes: List[Tuple[str, Any]] = []
+    for uri, original_content, updated_content in prepared_writes:
+        attempted_writes.append((uri, original_content))
+        try:
             await viking_fs.write_file(
                 uri,
-                MemoryFileUtils.write(mf),
+                updated_content,
                 ctx=ctx,
                 **lock_kwargs,
             )
-            updated_uris.append(uri)
+            readback = await viking_fs.read_file(uri, ctx=ctx)
+            if readback != updated_content:
+                raise RuntimeError("endpoint readback did not match the published content")
         except Exception as e:
-            tracer.error(f"Failed to apply links to {uri}: {e}")
-    return updated_uris
+            rollback_failures: List[Tuple[str, Exception]] = []
+            for rollback_uri, rollback_content in reversed(attempted_writes):
+                try:
+                    await viking_fs.write_file(
+                        rollback_uri,
+                        rollback_content,
+                        ctx=ctx,
+                        **lock_kwargs,
+                    )
+                    rollback_readback = await viking_fs.read_file(rollback_uri, ctx=ctx)
+                    if rollback_readback != rollback_content:
+                        raise RuntimeError(
+                            "rollback readback did not match the pre-publication content"
+                        )
+                except Exception as rollback_error:
+                    rollback_failures.append((rollback_uri, rollback_error))
+                    tracer.error(
+                        f"Failed to roll back link publication for {rollback_uri}: "
+                        f"{rollback_error}"
+                    )
+            raise _LinkPublicationError(uri, "write", e, rollback_failures) from e
+    return [uri for uri, _, _ in prepared_writes]
 
 
 
@@ -668,6 +778,7 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.index_pending_uris: List[str] = []
         self.errors: List[Tuple[str, Exception]] = []
 
     def add_written(self, uri: str) -> None:
@@ -679,6 +790,10 @@ class MemoryUpdateResult:
     def add_deleted(self, uri: str) -> None:
         self.deleted_uris.append(uri)
 
+    def add_index_pending(self, uri: str) -> None:
+        if uri not in self.index_pending_uris:
+            self.index_pending_uris.append(uri)
+
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
 
@@ -687,6 +802,7 @@ class MemoryUpdateResult:
             f"Written: {len(self.written_uris)}, "
             f"Edited: {len(self.edited_uris)}, "
             f"Deleted: {len(self.deleted_uris)}, "
+            f"Index pending: {len(self.index_pending_uris)}, "
             f"Errors: {len(self.errors)}"
         )
 
@@ -830,11 +946,120 @@ class MemoryUpdater:
                 f"Skipping unresolved memory operation: {error_target}: {resolution_error}"
             )
 
-        # Distribute resolved_links to corresponding upsert operations
-        self._distribute_links_to_operations(operations)
+        # Automatic extraction and training are fail-closed for experience admission. Validate even
+        # unresolved operations, then return before links, writes, deletes, vectors, or overviews so a
+        # malformed or unresolved split cannot partially publish. Privileged direct-storage APIs remain
+        # available for separately verified legacy migration and administrative repair.
+        experience_errors = validate_experience_operations(
+            operations.upsert_operations,
+            validate_existing=False,
+        )
+        experience_errors.extend(
+            validate_experience_operation_context(operations.upsert_operations, ctx)
+        )
+        unresolved_experiences = [
+            op
+            for op in operations.upsert_operations
+            if op.memory_type == "experiences" and not op.uris
+        ]
+        experience_delete_errors: list[tuple[str, str]] = []
+        for file_content in operations.delete_file_contents:
+            delete_uri = str(file_content.uri or "")
+            declared_type = str(file_content.memory_type or "")
+            if declared_type == "experiences" or uri_targets_experience_store(delete_uri):
+                experience_delete_errors.append(
+                    (
+                        delete_uri or "experiences",
+                        "Automatic experience deletion is disabled; retain the source for a "
+                        "separately verified administrative migration.",
+                    )
+                )
+        for deleted_uri, replacement_uri in dict(
+            getattr(operations, "delete_replacements", {}) or {}
+        ).items():
+            if uri_targets_experience_store(deleted_uri) or uri_targets_experience_store(
+                replacement_uri
+            ):
+                experience_delete_errors.append(
+                    (
+                        str(deleted_uri),
+                        "Automatic experience replacement mappings are disabled; use a separately "
+                        "verified administrative migration.",
+                    )
+                )
+
+        if experience_errors or unresolved_experiences or experience_delete_errors:
+            for error in experience_errors:
+                target = (error.get("uris") or ["experiences"])[0]
+                result.add_error(target, ValueError(error["message"]))
+            for operation in unresolved_experiences:
+                target = f"experiences(page_id={operation.page_id})"
+                if not any(error_target == target for error_target, _ in result.errors):
+                    result.add_error(target, ValueError("Missing resolved experience URI"))
+            for target, message in experience_delete_errors:
+                result.add_error(target, ValueError(message))
+            tracer.error(f"Rejected experience operations before apply: {experience_errors}")
+            return result
+
+        experience_read_errors: list[tuple[str, str]] = []
+        experience_snapshots: Dict[str, _FileSnapshot] = {}
+        for operation in operations.upsert_operations:
+            if operation.memory_type != "experiences":
+                continue
+            uri = operation.uris[0]
+            supplied_old = operation.old_memory_file_content
+            try:
+                raw_current = await viking_fs.read_file(uri, ctx=ctx)
+            except NotFoundError:
+                experience_snapshots[uri] = _FileSnapshot(existed=False)
+                if supplied_old is not None:
+                    experience_read_errors.append(
+                        (uri, "Existing experience disappeared during admission preflight.")
+                    )
+                continue
+            except Exception as exc:
+                experience_read_errors.append(
+                    (uri, f"Could not verify existing experience before update: {exc}")
+                )
+                continue
+            experience_snapshots[uri] = _FileSnapshot(existed=True, content=raw_current)
+            try:
+                current_file = MemoryFileUtils.read(raw_current, uri=uri)
+                operation.old_memory_file_content = current_file
+            except Exception as exc:
+                experience_read_errors.append(
+                    (uri, f"Could not parse existing experience before update: {exc}")
+                )
+                continue
+            stored_errors = validate_stored_experience(current_file, uri)
+            if stored_errors:
+                experience_read_errors.append(
+                    (
+                        uri,
+                        "Existing experience is legacy-invalid and read-only: "
+                        + repr([error["code"] for error in stored_errors]),
+                    )
+                )
+
+        experience_errors = validate_experience_operations(operations.upsert_operations)
+        if experience_read_errors or experience_errors:
+            for target, message in experience_read_errors:
+                result.add_error(target, ValueError(message))
+            for error in experience_errors:
+                target = (error.get("uris") or ["experiences"])[0]
+                result.add_error(target, ValueError(error["message"]))
+            tracer.error(
+                "Rejected experience update after authoritative legacy readback: "
+                f"{experience_errors}"
+            )
+            return result
 
         # Apply unified operations - _apply_edit returns True if edited, False if written
+        attempted_experience_uris: List[str] = []
+        experience_apply_failed = False
         for resolved_op in applicable_upserts:
+            if resolved_op.memory_type == "experiences":
+                attempted_experience_uris.extend(resolved_op.uris)
             try:
                 await self._apply_upsert(
                     resolved_op,
@@ -849,18 +1074,146 @@ class MemoryUpdater:
                     for uri in resolved_op.uris:
                         result.add_written(uri)
             except Exception as e:
+                if resolved_op.memory_type == "experiences":
+                    experience_apply_failed = True
                 tracer.error(
                     f"Failed to apply operation: op_type={type(resolved_op).__name__}, uris={resolved_op.uris}",
                     e,
                 )
                 for uri in resolved_op.uris:
                     result.add_error(uri, e)
+                if resolved_op.memory_type == "experiences":
+                    break
 
-        operations.resolved_links = remap_stored_links(
-            list(getattr(operations, "resolved_links", []) or []),
-            dict(getattr(operations, "delete_replacements", {}) or {}),
+        if experience_apply_failed:
+            await self._rollback_experience_files(
+                experience_snapshots,
+                attempted_experience_uris,
+                result,
+                ctx,
+                reason="one or more experience content writes failed",
+            )
+            return result
+
+        declared_upsert_uris = {
+            uri for operation in operations.upsert_operations for uri in operation.uris
+        }
+        successful_upsert_uris = set(result.written_uris + result.edited_uris)
+        failed_replacement_deletes: set[str] = set()
+        safe_delete_replacements: dict[str, str] = {}
+        for deleted_uri, replacement_uri in dict(
+            getattr(operations, "delete_replacements", {}) or {}
+        ).items():
+            if (
+                replacement_uri in declared_upsert_uris
+                and replacement_uri not in successful_upsert_uris
+            ):
+                failed_replacement_deletes.add(deleted_uri)
+                result.add_error(
+                    deleted_uri,
+                    ValueError(f"Skipped delete because replacement write failed: {replacement_uri}"),
+                )
+                continue
+            safe_delete_replacements[deleted_uri] = replacement_uri
+        operations.delete_replacements = safe_delete_replacements
+
+        original_resolved_links = list(getattr(operations, "resolved_links", []) or [])
+        remapped_resolved_links = remap_stored_links(
+            original_resolved_links,
+            safe_delete_replacements,
         )
-        await self._inherit_deleted_link_relations(operations, result, ctx)
+        attempted_experience_set = set(attempted_experience_uris)
+        admitted_resolved_links: List[StoredLink] = []
+        dropped_required_experience_links: List[StoredLink] = []
+        for link in remapped_resolved_links:
+            endpoints_published = all(
+                endpoint not in declared_upsert_uris or endpoint in successful_upsert_uris
+                for endpoint in (link.from_uri, link.to_uri)
+            )
+            if endpoints_published:
+                admitted_resolved_links.append(link)
+            elif any(
+                endpoint in attempted_experience_set
+                for endpoint in (link.from_uri, link.to_uri)
+            ):
+                dropped_required_experience_links.append(link)
+        operations.resolved_links = admitted_resolved_links
+        if dropped_required_experience_links:
+            for link in dropped_required_experience_links:
+                experience_uri = next(
+                    endpoint
+                    for endpoint in (link.from_uri, link.to_uri)
+                    if endpoint in attempted_experience_set
+                )
+                result.add_error(
+                    experience_uri,
+                    ValueError(
+                        "Required experience relation endpoint did not publish: "
+                        f"{link.from_uri} -> {link.to_uri}"
+                    ),
+                )
+            await self._rollback_experience_files(
+                experience_snapshots,
+                attempted_experience_uris,
+                result,
+                ctx,
+                reason="required experience relation endpoint did not publish",
+            )
+            return result
+        if safe_delete_replacements:
+            inheritance_succeeded = await self._inherit_deleted_link_relations(
+                operations, result, ctx
+            )
+            if not inheritance_succeeded:
+                for deleted_uri in safe_delete_replacements:
+                    failed_replacement_deletes.add(deleted_uri)
+                    result.add_error(
+                        deleted_uri,
+                        ValueError(
+                            "Skipped delete because replacement link inheritance failed"
+                        ),
+                    )
+                operations.delete_replacements = {}
+                operations.resolved_links = [
+                    link
+                    for link in original_resolved_links
+                    if link.from_uri not in safe_delete_replacements
+                    and link.to_uri not in safe_delete_replacements
+                ]
+
+        def relation_identity(link: StoredLink) -> tuple[str, str, str, Optional[str]]:
+            return (link.from_uri, link.to_uri, link.link_type, link.match_text)
+
+        required_experience_relations = {
+            relation_identity(link)
+            for link in remapped_resolved_links
+            if any(
+                endpoint in attempted_experience_set
+                for endpoint in (link.from_uri, link.to_uri)
+            )
+        }
+        admitted_relation_identities = {
+            relation_identity(link) for link in operations.resolved_links
+        }
+        missing_experience_relations = (
+            required_experience_relations - admitted_relation_identities
+        )
+        if missing_experience_relations:
+            result.add_error(
+                next(iter(attempted_experience_set)),
+                ValueError(
+                    "Required experience relation was lost during replacement inheritance: "
+                    + repr(sorted(missing_experience_relations, key=repr))
+                ),
+            )
+            await self._rollback_experience_files(
+                experience_snapshots,
+                attempted_experience_uris,
+                result,
+                ctx,
+                reason="required experience relation was lost during replacement inheritance",
+            )
+            return result
 
         # Apply delete operations (delete_file_contents is List[MemoryFile])
         # Skip deletes whose URI was just written in the same batch — this happens when the
@@ -870,6 +1223,11 @@ class MemoryUpdater:
         upserted_uri_keys = {_same_batch_delete_conflict_key(uri) for uri in upserted_uris}
         for file_content in operations.delete_file_contents:
             delete_uri = file_content.uri
+            if delete_uri in failed_replacement_deletes:
+                tracer.error(
+                    f"Skipping delete for {delete_uri}: replacement was not safely published"
+                )
+                continue
             if has_unresolved_upserts:
                 delete_error = ValueError(
                     "Skipped delete because batch contains unresolved upsert URIs"
@@ -896,6 +1254,37 @@ class MemoryUpdater:
                 tracer.error(f"Failed to delete memory {delete_uri}", e)
                 result.add_error(delete_uri, e)
 
+        # Publish relations only after every declared endpoint is known to have succeeded. This
+        # prevents an earlier successful write or an existing neighbor from gaining a dangling link
+        # when a later upsert fails.
+        experience_link_batch = any(
+            uri_targets_experience_store(endpoint)
+            for link in operations.resolved_links
+            for endpoint in (link.from_uri, link.to_uri)
+        )
+        links_published = True
+        if operations.resolved_links:
+            links_published = await self._apply_links_to_existing_files(
+                operations.resolved_links,
+                result,
+                ctx,
+                deleted_uris=set(result.deleted_uris),
+                include_upserted=True,
+            )
+
+        if attempted_experience_uris and experience_link_batch and not links_published:
+            tracer.error(
+                "Experience batch remains unpublished because relation publication failed"
+            )
+            await self._rollback_experience_files(
+                experience_snapshots,
+                attempted_experience_uris,
+                result,
+                ctx,
+                reason="experience relation publication failed",
+            )
+            return result
+
         await self._sync_resource_refs_for_result(result, ctx)
 
         # Vectorize written and edited memories
@@ -909,15 +1298,6 @@ class MemoryUpdater:
             extract_context=extract_context,
             uri_memory_type_map=uri_memory_type_map,
         )
-
-        # Apply links to endpoint files not covered by upsert_operations
-        if operations.resolved_links:
-            await self._apply_links_to_existing_files(
-                operations.resolved_links,
-                result,
-                ctx,
-                deleted_uris=set(result.deleted_uris),
-            )
 
         tracer.info(f"Memory operations applied: {result.summary()}")
 
@@ -940,6 +1320,69 @@ class MemoryUpdater:
             await self.generate_overview(memory_type, dir, ctx, extract_context)
 
         return result
+
+    async def _rollback_experience_files(
+        self,
+        snapshots: Dict[str, _FileSnapshot],
+        attempted_uris: List[str],
+        result: MemoryUpdateResult,
+        ctx: RequestContext,
+        *,
+        reason: str,
+    ) -> None:
+        """Restore exact experience blobs after canonical publication fails.
+
+        The caller holds the same transaction lock used by the writes. This is
+        compensating I/O, not a storage transaction, so every restoration is
+        read back and any rollback failure remains explicit in ``result``.
+        """
+        viking_fs = self._get_viking_fs()
+        rollback_uris = list(dict.fromkeys(attempted_uris))
+        rollback_set = set(rollback_uris)
+        result.written_uris = [uri for uri in result.written_uris if uri not in rollback_set]
+        result.edited_uris = [uri for uri in result.edited_uris if uri not in rollback_set]
+        result.index_pending_uris = [
+            uri for uri in result.index_pending_uris if uri not in rollback_set
+        ]
+
+        for uri in reversed(rollback_uris):
+            snapshot = snapshots.get(uri)
+            result.add_error(uri, RuntimeError(f"Experience publication rolled back: {reason}"))
+            if snapshot is None:
+                result.add_error(uri, RuntimeError("Experience rollback snapshot is missing"))
+                continue
+            try:
+                if snapshot.existed:
+                    await viking_fs.write_file(
+                        uri,
+                        snapshot.content,
+                        ctx=ctx,
+                        lock_handle=self._transaction_handle,
+                    )
+                    readback = await viking_fs.read_file(uri, ctx=ctx)
+                    if readback != snapshot.content:
+                        raise RuntimeError(
+                            "Experience rollback readback did not match the original blob"
+                        )
+                else:
+                    try:
+                        await viking_fs.rm(
+                            uri,
+                            recursive=False,
+                            ctx=ctx,
+                            lock_handle=self._transaction_handle,
+                        )
+                    except NotFoundError:
+                        pass
+                    try:
+                        remaining = await viking_fs.read_file(uri, ctx=ctx)
+                    except (NotFoundError, FileNotFoundError):
+                        remaining = None
+                    if remaining is not None:
+                        raise RuntimeError("New experience still exists after rollback delete")
+            except Exception as exc:
+                tracer.error(f"Failed to roll back experience publication for {uri}: {exc}")
+                result.add_error(uri, RuntimeError(f"Experience rollback failed: {exc}"))
 
     async def _sync_resource_refs_for_result(
         self,
@@ -981,6 +1424,13 @@ class MemoryUpdater:
 
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
+        if memory_type == "experiences":
+            final_experience_errors = validate_experience_operations([resolved_op])
+            if final_experience_errors:
+                raise ValueError(
+                    "Experience content failed final admission immediately before persistence: "
+                    + repr(final_experience_errors)
+                )
         # Process each URI independently
         for uri in resolved_op.uris:
             # Always read from disk first to get the latest content,
@@ -988,9 +1438,22 @@ class MemoryUpdater:
             old_content: Optional[MemoryFile] = None
             try:
                 content = await viking_fs.read_file(uri, ctx=ctx)
-                if content:
+                if memory_type == "experiences" or content:
                     old_content = MemoryFileUtils.read(content, uri=uri)
+                    if memory_type == "experiences":
+                        current_experience_errors = validate_stored_experience(old_content, uri)
+                        if current_experience_errors:
+                            raise ValueError(
+                                "Existing experience changed to a legacy-invalid state during "
+                                "persistence: "
+                                + repr(current_experience_errors)
+                            )
+            except NotFoundError:
+                if memory_type == "experiences" and resolved_op.old_memory_file_content is not None:
+                    raise ValueError("Existing experience disappeared before persistence.")
             except Exception:
+                if memory_type == "experiences":
+                    raise
                 # File doesn't exist yet, that's okay
                 pass
             # Fall back to pre-fetched content if disk read failed
@@ -1081,6 +1544,14 @@ class MemoryUpdater:
                     metadata["backlinks"] = existing_backlinks
 
             mf = MemoryFile.from_parsed(uri=uri, parsed=metadata)
+            if memory_type == "experiences":
+                stored_experience_errors = validate_stored_experience(mf, uri)
+                if stored_experience_errors:
+                    raise ValueError(
+                        "Experience failed final stored-file admission immediately before "
+                        "persistence: "
+                        + repr(stored_experience_errors)
+                    )
             new_full_content = MemoryFileUtils.write(
                 mf,
                 content_template=schema.content_template,
@@ -1127,28 +1598,75 @@ class MemoryUpdater:
         result: MemoryUpdateResult,
         ctx: RequestContext,
         deleted_uris: Optional[set[str]] = None,
-    ) -> None:
-        """Apply links to endpoint files that are NOT in the current upsert batch."""
+        include_upserted: bool = False,
+    ) -> bool:
+        """Apply links to admitted endpoint files after content writes have succeeded."""
         viking_fs = self._get_viking_fs()
         if not viking_fs:
-            return
+            return False
         from openviking.core.namespace import context_type_for_uri
 
         upserted_uris = set(result.written_uris + result.edited_uris)
+        deleted = deleted_uris or set()
+        deleted_links = [
+            link
+            for link in resolved_links
+            if link.from_uri in deleted or link.to_uri in deleted
+        ]
+        dropped_experience_links = [
+            link
+            for link in deleted_links
+            if uri_targets_experience_store(link.from_uri)
+            or uri_targets_experience_store(link.to_uri)
+        ]
+        if dropped_experience_links:
+            first = dropped_experience_links[0]
+            experience_uri = (
+                first.from_uri
+                if uri_targets_experience_store(first.from_uri)
+                else first.to_uri
+            )
+            result.add_error(
+                experience_uri,
+                ValueError(
+                    "Required experience relation endpoint was deleted before link publication: "
+                    f"{first.from_uri} -> {first.to_uri}"
+                ),
+            )
+            return False
+        admitted_links = [
+            link
+            for link in resolved_links
+            if link.from_uri not in deleted and link.to_uri not in deleted
+        ]
+        if not admitted_links:
+            return True
         non_memory_endpoints = {
             uri
-            for link in resolved_links
+            for link in admitted_links
             for uri in (link.from_uri, link.to_uri)
             if context_type_for_uri(uri) != "memory"
         }
-        skip = upserted_uris | (deleted_uris or set()) | non_memory_endpoints
-        await write_stored_links(
-            resolved_links,
-            ctx,
-            viking_fs,
-            skip_uris=skip,
-            lock_handle=self._transaction_handle,
-        )
+        skip = (
+            set() if include_upserted else upserted_uris
+        ) | non_memory_endpoints
+        try:
+            updated_uris = await write_stored_links(
+                admitted_links,
+                ctx,
+                viking_fs,
+                skip_uris=skip,
+                preserve_version_uris=upserted_uris if include_upserted else set(),
+                lock_handle=self._transaction_handle,
+            )
+        except _LinkPublicationError as error:
+            tracer.error(f"Deferred link publication failed: {error}")
+            result.add_error(error.failed_uri, error)
+            return False
+        for uri in updated_uris:
+            if uri not in upserted_uris and uri not in result.edited_uris:
+                result.add_edited(uri)
+        return True
 
 
     async def _inherit_deleted_link_relations(
@@ -1156,17 +1674,19 @@ class MemoryUpdater:
         operations: ResolvedOperations,
         result: MemoryUpdateResult,
         ctx: RequestContext,
-    ) -> None:
+    ) -> bool:
         uri_remap = dict(getattr(operations, "delete_replacements", {}) or {})
         if not uri_remap:
-            return
+            return True
         viking_fs = self._get_viking_fs()
         if not viking_fs:
-            return
+            result.add_error(
+                next(iter(uri_remap)),
+                RuntimeError("Cannot inherit replacement links without VikingFS"),
+            )
+            return False
 
-        from openviking.session.memory.merge_op.link_merge import merge_links
-
-        inherited_by_uri: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        inherited_links: List[StoredLink] = []
         for deleted_uri, replacement_uri in uri_remap.items():
             if not deleted_uri or not replacement_uri or deleted_uri == replacement_uri:
                 continue
@@ -1174,67 +1694,58 @@ class MemoryUpdater:
                 content = await viking_fs.read_file(deleted_uri, ctx=ctx)
             except Exception as e:
                 tracer.error(f"Failed to read deleted memory links for replacement {deleted_uri}: {e}")
-                continue
+                result.add_error(deleted_uri, e)
+                return False
             if not content:
-                continue
-            deleted_file = MemoryFileUtils.read(content, uri=deleted_uri)
-            for link in list(deleted_file.links or []):
-                remapped = _remap_link_dict(link, uri_remap)
-                if remapped.get("from_uri") == remapped.get("to_uri"):
-                    continue
-                target_uri = remapped.get("from_uri")
-                if target_uri:
-                    inherited_by_uri.setdefault(target_uri, {"links": [], "backlinks": []})[
-                        "links"
-                    ].append(remapped)
-                neighbor_uri = remapped.get("to_uri")
-                if neighbor_uri and neighbor_uri not in uri_remap:
-                    inherited_by_uri.setdefault(neighbor_uri, {"links": [], "backlinks": []})[
-                        "backlinks"
-                    ].append(remapped)
-            for link in list(deleted_file.backlinks or []):
-                remapped = _remap_link_dict(link, uri_remap)
-                if remapped.get("from_uri") == remapped.get("to_uri"):
-                    continue
-                target_uri = remapped.get("to_uri")
-                if target_uri:
-                    inherited_by_uri.setdefault(target_uri, {"links": [], "backlinks": []})[
-                        "backlinks"
-                    ].append(remapped)
-                neighbor_uri = remapped.get("from_uri")
-                if neighbor_uri and neighbor_uri not in uri_remap:
-                    inherited_by_uri.setdefault(neighbor_uri, {"links": [], "backlinks": []})[
-                        "links"
-                    ].append(remapped)
-
-        written_or_edited = set(result.written_uris + result.edited_uris)
-        for uri, link_groups in inherited_by_uri.items():
-            if uri in uri_remap:
-                continue
-            if uri in written_or_edited:
-                continue
+                error = ValueError("Deleted memory is empty during replacement link inheritance")
+                result.add_error(deleted_uri, error)
+                return False
             try:
-                content = await viking_fs.read_file(uri, ctx=ctx)
-                if not content:
-                    continue
-                mf = MemoryFileUtils.read(content, uri=uri)
-                if link_groups["links"]:
-                    mf.links = merge_links(mf.links, link_groups["links"])
-                if link_groups["backlinks"]:
-                    mf.backlinks = merge_links(mf.backlinks, link_groups["backlinks"])
-                current_trace_id = get_trace_id()
-                if current_trace_id:
-                    mf.extra_fields["last_update_trace_id"] = current_trace_id
-                bump_memory_version(mf)
-                await viking_fs.write_file(
-                    uri,
-                    MemoryFileUtils.write(mf),
-                    ctx=ctx,
-                    lock_handle=self._transaction_handle,
-                )
-                result.add_edited(uri)
+                deleted_file = MemoryFileUtils.read(content, uri=deleted_uri)
             except Exception as e:
-                tracer.error(f"Failed to inherit deleted memory links for {uri}: {e}")
+                tracer.error(
+                    f"Failed to parse deleted memory links for replacement {deleted_uri}: {e}"
+                )
+                result.add_error(deleted_uri, e)
+                return False
+            try:
+                for link in list(deleted_file.links or []):
+                    remapped = _remap_link_dict(link, uri_remap)
+                    if remapped.get("from_uri") == remapped.get("to_uri"):
+                        continue
+                    inherited_links.append(StoredLink(**remapped))
+                for link in list(deleted_file.backlinks or []):
+                    remapped = _remap_link_dict(link, uri_remap)
+                    if remapped.get("from_uri") == remapped.get("to_uri"):
+                        continue
+                    inherited_links.append(StoredLink(**remapped))
+            except Exception as e:
+                tracer.error(
+                    f"Failed to validate inherited links for replacement {deleted_uri}: {e}"
+                )
+                result.add_error(deleted_uri, e)
+                return False
+
+        if not inherited_links:
+            return True
+        written_or_edited = set(result.written_uris + result.edited_uris)
+        try:
+            updated_uris = await write_stored_links(
+                inherited_links,
+                ctx,
+                viking_fs,
+                skip_uris=set(uri_remap),
+                preserve_version_uris=written_or_edited,
+                lock_handle=self._transaction_handle,
+            )
+        except _LinkPublicationError as error:
+            tracer.error(f"Failed to inherit replacement links: {error}")
+            result.add_error(error.failed_uri, error)
+            return False
+        for uri in updated_uris:
+            if uri not in written_or_edited:
+                result.add_edited(uri)
+        return True
 
     async def _apply_delete(self, uri: str, ctx: RequestContext) -> None:
         """Apply delete operation (uri is already a string)."""
@@ -1265,11 +1776,20 @@ class MemoryUpdater:
             extract_context: Extract context for embedding template rendering
             uri_memory_type_map: Mapping from URI to memory_type
         """
+        uri_memory_type_map = uri_memory_type_map or {}
+        deleted_set = set(result.deleted_uris)
+
+        def is_experience_uri(uri: str) -> bool:
+            memory_type = uri_memory_type_map.get(uri) or self.memory_type_from_uri(uri)
+            return memory_type == "experiences"
+
         if not self._vikingdb:
+            for uri in dict.fromkeys(result.written_uris + result.edited_uris):
+                if uri not in deleted_set and is_experience_uri(uri):
+                    result.add_index_pending(uri)
             logger.debug("VikingDB not available, skipping vectorization")
             return 0
 
-        uri_memory_type_map = uri_memory_type_map or {}
         viking_fs = self._get_viking_fs()
         request_wait_tracker = get_request_wait_tracker()
         attempted_count = 0
@@ -1277,7 +1797,6 @@ class MemoryUpdater:
         # Collect all URIs to vectorize (skip .overview.md and .abstract.md - they are handled separately)
         # Also skip URIs that were deleted in the same batch
         uris_to_vectorize = []
-        deleted_set = set(result.deleted_uris)
         for uri in result.written_uris + result.edited_uris:
             if uri in deleted_set:
                 continue
@@ -1300,7 +1819,7 @@ class MemoryUpdater:
                 abstract = self._truncate_memory_abstract(abstract)
                 embedding_text = abstract
 
-                memory_type = uri_memory_type_map.get(uri)
+                memory_type = uri_memory_type_map.get(uri) or self.memory_type_from_uri(uri)
                 if memory_type and self._registry:
                     schema = self._registry.get(memory_type)
                     if schema and schema.embedding_template:
@@ -1371,10 +1890,18 @@ class MemoryUpdater:
                             embedding_msg.id,
                             "embedding enqueue returned false",
                         )
-                    logger.debug(f"Enqueued memory for vectorization: {uri}")
+                    if not enqueued:
+                        if is_experience_uri(uri):
+                            result.add_index_pending(uri)
+                    else:
+                        logger.debug(f"Enqueued memory for vectorization: {uri}")
+                elif is_experience_uri(uri):
+                    result.add_index_pending(uri)
 
             except Exception as e:
                 tracer.error(f"Failed to vectorize memory {uri}: {e}")
+                if is_experience_uri(uri):
+                    result.add_index_pending(uri)
         return attempted_count
 
     @staticmethod

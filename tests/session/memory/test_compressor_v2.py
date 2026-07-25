@@ -28,7 +28,6 @@ from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
 from openviking.session.memory.merge_op import FieldType, MergeOp
-from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import get_openviking_config, initialize_openviking_config
 
@@ -713,89 +712,6 @@ class TestCompressorV2:
 
         assert result[0] == ["viking://user/default/memories/experiences/debug.md"]
         assert events == ["acquire", "apply", "post_apply", "release"]
-
-    @pytest.mark.asyncio
-    async def test_append_trajectories_uses_exact_lock(self):
-        """Fallback source metadata append should protect the read-modify-write."""
-        compressor = SessionCompressorV2(vikingdb=None)
-        user = UserIdentifier.the_default_user()
-        ctx = RequestContext(user=user, role=Role.ROOT)
-        exp_uri = "viking://user/default/memories/experiences/debug.md"
-        events: List[str] = []
-
-        traj_uri = "viking://user/default/memories/trajectories/traj-1.md"
-
-        class FakeVikingFS:
-            def __init__(self):
-                self.files = {
-                    exp_uri: MemoryFileUtils.write(
-                        MemoryFile(uri=exp_uri, content="debug login issue")
-                    ),
-                    traj_uri: MemoryFileUtils.write(
-                        MemoryFile(uri=traj_uri, content="traj content")
-                    ),
-                }
-
-            def _uri_to_path(self, uri: str, ctx=None) -> str:
-                return f"/local/default/user/default/memories/experiences/{uri.rsplit('/', 1)[-1]}"
-
-            async def read_file(self, uri: str, ctx=None):
-                events.append("read")
-                return self.files.get(uri, "")
-
-            async def write_file(self, uri: str, content: str, ctx=None, lock_handle=None):
-                events.append("write")
-                self.files[uri] = content
-
-        handle = SimpleNamespace(id="handle-1", locks=[])
-
-        async def acquire_exact_path_batch(_handle, paths):
-            events.append(f"exact:{paths[0]}")
-            return True
-
-        async def release(_handle):
-            events.append("release")
-
-        lock_manager = SimpleNamespace(
-            create_handle=lambda: handle,
-            acquire_exact_path_batch=AsyncMock(side_effect=acquire_exact_path_batch),
-            release=AsyncMock(side_effect=release),
-        )
-        viking_fs = FakeVikingFS()
-
-        with patch("openviking.storage.transaction.get_lock_manager", return_value=lock_manager):
-            await compressor._append_trajectories_to_experiences(
-                [exp_uri],
-                [traj_uri],
-                ctx,
-                viking_fs,
-            )
-
-        # exp: exp.links 有指向 traj 的边（exp→traj, derived_from）
-        exp_mf = MemoryFileUtils.read(viking_fs.files[exp_uri], uri=exp_uri)
-        assert "source_trajectories" not in exp_mf.extra_fields
-        assert any(l.get("to_uri") == traj_uri for l in exp_mf.links), (
-            "exp.links should point to traj"
-        )
-        assert exp_mf.backlinks == [], "exp should have no backlinks"
-
-        # traj: write_stored_links 写入 traj.backlinks（同一条边的 to 端）
-        traj_mf = MemoryFileUtils.read(viking_fs.files[traj_uri], uri=traj_uri)
-        assert traj_mf.links == [], "traj should have no forward links"
-        assert any(l.get("from_uri") == exp_uri for l in traj_mf.backlinks), (
-            "traj.backlinks should reference exp"
-        )
-
-        # event order: lock → read exp → write exp → read traj → write traj → release
-        assert events == [
-            "exact:/local/default/user/default/memories/experiences/debug.md",
-            "read",  # exp read
-            "write",  # exp write (exp.links)
-            "read",  # traj read  (write_stored_links)
-            "write",  # traj write (traj.backlinks)
-            "release",
-        ]
-
 
 class TestExtractLoopPatchRepair:
     """Tests for ExtractLoop patch validation and repair retry."""

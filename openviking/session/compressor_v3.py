@@ -716,7 +716,13 @@ class SessionCompressorV3:
                         viking_fs=viking_fs,
                     )
                 exp_apply_result = getattr(exp_training_result, "apply_result", None)
-                if exp_apply_result is not None:
+                exp_apply_errors = (
+                    list(getattr(exp_apply_result, "errors", []) or [])
+                    if exp_apply_result is not None
+                    else []
+                )
+                exp_apply_succeeded = exp_apply_result is not None and not exp_apply_errors
+                if exp_apply_succeeded:
                     await _commit_experience_snapshot(
                         viking_fs,
                         ctx=ctx,
@@ -725,6 +731,11 @@ class SessionCompressorV3:
                             *list(getattr(exp_apply_result, "deleted_uris", []) or []),
                         ],
                         archive_uri=archive_uri,
+                    )
+                elif exp_apply_errors:
+                    logger.warning(
+                        "Experience update was not committed because apply reported %d error(s)",
+                        len(exp_apply_errors),
                     )
                 # Skill path: co-extracted skill gradients go directly to skill trainer
                 if skill_trainer is not None and analysis.gradients:
@@ -744,7 +755,8 @@ class SessionCompressorV3:
                                 if uri:
                                     skill_uris.append(str(uri))
 
-                submitted += 1
+                if exp_apply_succeeded:
+                    submitted += 1
 
                 if collect_memory_diff:
                     # Build diff from the strongly typed training result returned by
@@ -812,9 +824,21 @@ class SessionCompressorV3:
                     }
                 )
 
-        applied_uris = set(training_result.apply_result.written_uris)
-        deleted_uris = set(training_result.apply_result.deleted_uris)
-        root_uri = training_result.apply_result.updated_policy_set.root_uri
+        apply_result = training_result.apply_result
+        if list(getattr(apply_result, "errors", []) or []):
+            # Publication failed before the experience commit boundary, so the updater
+            # restores or removes affected experience bodies and withholds refs, vector
+            # publication, and overviews. Do not advertise them as committed memory.
+            return _make_memory_diff(
+                archive_uri=archive_uri,
+                adds=adds,
+                updates=updates,
+                deletes=deletes,
+            )
+
+        applied_uris = set(apply_result.written_uris)
+        deleted_uris = set(apply_result.deleted_uris)
+        root_uri = apply_result.updated_policy_set.root_uri
         if not root_uri:
             raise ValueError(
                 "PolicyApplyResult.updated_policy_set.root_uri is required for training memory diff"
@@ -899,13 +923,46 @@ class SessionCompressorV3:
         )
         if not links:
             return
-        await _render_case_links_from_template(
+        original_case, rendered_case = await _prepare_case_links_from_template(
             case_uri=case_uri,
             links=links,
             ctx=ctx,
             viking_fs=viking_fs,
         )
-        await write_stored_links(links, ctx, viking_fs, skip_uris={case_uri})
+        case_write_attempted = False
+        try:
+            # The case uses a schema-specific content template, so the generic link
+            # writer cannot render it. Write that prepared endpoint first, then let
+            # the compensated writer publish every target backlink as one batch.
+            case_write_attempted = True
+            await viking_fs.write_file(case_uri, rendered_case, ctx=ctx)
+            case_readback = await viking_fs.read_file(case_uri, ctx=ctx)
+            if case_readback != rendered_case:
+                raise RuntimeError(
+                    "Case endpoint readback did not match the published link content"
+                )
+            await write_stored_links(links, ctx, viking_fs, skip_uris={case_uri})
+        except Exception as exc:
+            rollback_error = None
+            if case_write_attempted:
+                try:
+                    await viking_fs.write_file(case_uri, original_case, ctx=ctx)
+                    rollback_readback = await viking_fs.read_file(case_uri, ctx=ctx)
+                    if rollback_readback != original_case:
+                        raise RuntimeError(
+                            "Case rollback readback did not match the pre-publication content"
+                        )
+                except Exception as restore_exc:
+                    rollback_error = restore_exc
+                    tracer.error(
+                        f"Failed to roll back case link publication for {case_uri}: {restore_exc}"
+                    )
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Failed to publish case training links and restore the case endpoint "
+                    f"{case_uri}: {rollback_error}"
+                ) from exc
+            raise
 
     async def _write_final_memory_diff(
         self,
@@ -1471,10 +1528,12 @@ def _case_experience_links_via_trajectories(
     plan: PolicyUpdatePlan,
     apply_result: PolicyApplyResult,
 ) -> list[StoredLink]:
-    if not trajectory_uris:
+    if not trajectory_uris or getattr(apply_result, "errors", None):
         return []
     touched = set(getattr(apply_result, "written_uris", []) or [])
     touched.update(getattr(apply_result, "edited_uris", []) or [])
+    if not touched:
+        return []
     result: list[StoredLink] = []
     seen: set[str] = set()
     root_uri = getattr(getattr(apply_result, "updated_policy_set", None), "root_uri", "")
@@ -1537,22 +1596,21 @@ def _stored_link(
     )
 
 
-async def _render_case_links_from_template(
+async def _prepare_case_links_from_template(
     *,
     case_uri: str,
     links: list[StoredLink],
     ctx: RequestContext,
     viking_fs: Any,
-) -> None:
+) -> tuple[Any, str]:
+    """Prepare a case link rewrite without publishing either graph endpoint."""
     if not links:
-        return
-    try:
-        raw = await viking_fs.read_file(case_uri, ctx=ctx)
-    except Exception as exc:
-        tracer.error(f"Failed to read case memory for link rendering {case_uri}: {exc}")
-        return
+        raise ValueError("At least one case training link is required")
+    raw = await viking_fs.read_file(case_uri, ctx=ctx)
+    if not raw:
+        raise ValueError(f"Case memory is empty: {case_uri}")
 
-    mf = MemoryFileUtils.read(raw or "", uri=case_uri)
+    mf = MemoryFileUtils.read(raw, uri=case_uri)
     from openviking.session.memory.merge_op.link_merge import merge_links
 
     merged_links = merge_links(mf.links, [link.model_dump() for link in links])
@@ -1561,10 +1619,9 @@ async def _render_case_links_from_template(
 
     schema = create_default_registry().get(_CASES_MEMORY_TYPE)
     content_template = schema.content_template if schema is not None else None
-    await viking_fs.write_file(
-        case_uri,
+    return (
+        raw,
         MemoryFileUtils.write(mf, content_template=content_template),
-        ctx=ctx,
     )
 
 

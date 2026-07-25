@@ -7,6 +7,7 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 """
 
 import asyncio
+import copy
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +20,10 @@ from openviking.session.memory.dataclass import (
     ResolvedOperation,
     ResolvedOperations,
     StoredLink,
+)
+from openviking.session.memory.experience_policy import (
+    EXPERIENCE_MEMORY_TYPE,
+    validate_experience_operations,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.merge_op import MergeOp
@@ -126,6 +131,7 @@ class ExtractLoop:
         self._format_retry_count = 0
         self._last_llm_failure_kind: Optional[str] = None
         self._last_llm_failure_content: str = ""
+        self._last_successful_llm_content: str = ""
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
@@ -156,7 +162,10 @@ class ExtractLoop:
         tools_used: List[Dict[str, Any]] = []
         # Reset format retry counter for each run
         self._format_retry_count = 0
+        self._last_successful_llm_content = ""
         patch_repair_count = 0
+        experience_repair_count = 0
+        preserved_experience_siblings: List[Dict[str, Any]] = []
 
         # 从 provider 获取 schemas（内部自动加载 registry）
         schemas = self.context_provider.get_memory_schemas(self.ctx)
@@ -203,7 +212,21 @@ class ExtractLoop:
         # Build initial messages from provider
         schema_str = json.dumps(json_schema, ensure_ascii=False)
         messages = []
-        page_id_rules = """
+        experience_only = bool(schemas) and all(
+            schema.memory_type == "experiences" for schema in schemas
+        )
+        if experience_only:
+            page_id_rules = """
+## Page ID Rules
+- Every memory item you create or edit MUST include "page_id".
+- For existing items, use the page_id shown in read/search results.
+- For new items, assign a unique page_id >= 100.
+- When editing an existing item, reuse its existing page_id.
+- Keep `delete_ids` empty, never emit `replacement_page_id`, and set `supersedes` to the empty string.
+- Leave existing and legacy experience files unchanged unless applying an exact in-place update to the same user intent and tool sequence.
+"""
+        else:
+            page_id_rules = """
 ## Page ID Rules
 - Every memory item you create or edit MUST include "page_id".
 - For existing items, use the page_id shown in read/search results.
@@ -283,6 +306,13 @@ The final output of the model must strictly follow the JSON Schema format shown 
             # If model returned final operations, check if refetch is needed
             if operations is not None:
                 final_operations, raw_links = await self.resolve_operations(operations)
+                if final_operations.has_errors():
+                    tracer.info(
+                        "Resolved memory operations failed validation; stopping before "
+                        "refetch or repair",
+                        console=True,
+                    )
+                    break
                 # Check if any write_uris target existing files that weren't read
                 refetch_uris = await self._check_unread_existing_files(final_operations)
                 if refetch_uris:
@@ -300,6 +330,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     patch_repair_count += 1
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
+                    self._append_last_successful_proposal(messages)
                     messages.append(
                         {
                             "role": "user",
@@ -311,6 +342,52 @@ The final output of the model must strictly follow the JSON Schema format shown 
                         console=True,
                     )
                     continue
+                experience_errors = validate_experience_operations(
+                    final_operations.upsert_operations
+                )
+                preservation_errors = (
+                    self._validate_preserved_experience_siblings(
+                        preserved_experience_siblings,
+                        final_operations.upsert_operations,
+                    )
+                    if experience_repair_count > 0
+                    else []
+                )
+                if experience_errors:
+                    if experience_repair_count == 0:
+                        preserved_experience_siblings = (
+                            self._capture_valid_experience_siblings(
+                                final_operations.upsert_operations,
+                                experience_errors,
+                            )
+                        )
+                        experience_repair_count += 1
+                        max_iterations += 1
+                        self._disable_tools_for_iteration = True
+                        self._append_last_successful_proposal(messages)
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": self._build_experience_repair_instruction(
+                                    experience_errors
+                                ),
+                            }
+                        )
+                        tracer.info(
+                            "Extended max_iterations for experience policy repair",
+                            console=True,
+                        )
+                        continue
+                    final_operations.errors.append(
+                        "Experience policy validation failed after one repair attempt: "
+                        + json.dumps(experience_errors, ensure_ascii=False)
+                    )
+                if preservation_errors:
+                    final_operations.errors.append(
+                        "Experience repair omitted or altered structurally valid first-pass "
+                        "operations: "
+                        + json.dumps(preservation_errors, ensure_ascii=False)
+                    )
                 break
             # If no tool calls either, continue to next iteration (don't break!)
             failure_kind = self._last_llm_failure_kind or "unknown"
@@ -370,6 +447,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
         upsert_operations: List[ResolvedOperation] = []
         delete_file_contents: List[MemoryFile] = []
         errors: List[str] = []
+        page_id_claims: Dict[int, Dict[str, Any]] = {}
 
         role_scope = self._isolation_handler.get_read_scope()
         page_id_map = getattr(self._extract_context, "page_id_map", None)
@@ -384,6 +462,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
             for item in items:
                 item_dict = dict(item)
+                proposed_experience_name = item_dict.get("experience_name")
                 item_dict["memory_type"] = memory_type
                 try:
                     self._isolation_handler.fill_identity_fields(
@@ -404,6 +483,50 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     )
 
                 page_id = item_dict.pop("page_id", None)
+                previous_claim = page_id_claims.get(page_id) if page_id is not None else None
+                current_claim = {
+                    "memory_type": memory_type,
+                    "experience_name": proposed_experience_name,
+                }
+                if previous_claim is not None and (
+                    memory_type == EXPERIENCE_MEMORY_TYPE
+                    or previous_claim["memory_type"] == EXPERIENCE_MEMORY_TYPE
+                ):
+                    errors.append(
+                        "Experience page_id validation failed: "
+                        + json.dumps(
+                            {
+                                "code": "duplicate_experience_page_id",
+                                "page_id": page_id,
+                                "first": previous_claim,
+                                "duplicate": current_claim,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+                elif page_id is not None:
+                    page_id_claims[page_id] = current_claim
+
+                if (
+                    memory_type == EXPERIENCE_MEMORY_TYPE
+                    and page_id is not None
+                    and page_id < 100
+                    and (page_id_map is None or page_id_map.resolve(page_id) is None)
+                ):
+                    errors.append(
+                        "Experience page_id validation failed: "
+                        + json.dumps(
+                            {
+                                "code": "unknown_existing_experience_page_id",
+                                "page_id": page_id,
+                                "proposed_experience_name": proposed_experience_name,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+
                 resolved_op = ResolvedOperation(
                     old_memory_file_content=None,
                     memory_fields=item_dict,
@@ -417,6 +540,43 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     if resolved_uri:
                         resolved_op.uris = [resolved_uri]
                         old_content = self.context_provider.read_file_contents.get(resolved_uri)
+                        experience_binding_valid = True
+                        if memory_type == EXPERIENCE_MEMORY_TYPE:
+                            uri_filename = str(resolved_uri).rsplit("/", 1)[-1]
+                            uri_bound_name = (
+                                uri_filename[:-3]
+                                if uri_filename.endswith(".md") and len(uri_filename) > 3
+                                else None
+                            )
+                            stored_bound_name = None
+                            if old_content is not None:
+                                stored_bound_name = old_content.extra_fields.get(
+                                    "experience_name"
+                                )
+                            bound_names = [
+                                name
+                                for name in (stored_bound_name, uri_bound_name)
+                                if isinstance(name, str) and name
+                            ]
+                            experience_binding_valid = bool(bound_names) and all(
+                                proposed_experience_name == name for name in bound_names
+                            )
+                            if not experience_binding_valid:
+                                errors.append(
+                                    "Experience page_id validation failed: "
+                                    + json.dumps(
+                                        {
+                                            "code": "experience_page_id_name_mismatch",
+                                            "page_id": page_id,
+                                            "proposed_experience_name": proposed_experience_name,
+                                            "resolved_uri": resolved_uri,
+                                            "stored_experience_name": stored_bound_name,
+                                            "uri_experience_name": uri_bound_name,
+                                        },
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    )
+                                )
                         if old_content is not None:
                             resolved_op.old_memory_file_content = old_content
                             immutable_fields = {
@@ -424,11 +584,12 @@ The final output of the model must strictly follow the JSON Schema format shown 
                                 for field in schema.fields
                                 if field.merge_op != MergeOp.PATCH
                             }
-                            for field_name in immutable_fields:
-                                if field_name in old_content.extra_fields:
-                                    resolved_op.memory_fields[field_name] = (
-                                        old_content.extra_fields[field_name]
-                                    )
+                            if experience_binding_valid:
+                                for field_name in immutable_fields:
+                                    if field_name in old_content.extra_fields:
+                                        resolved_op.memory_fields[field_name] = (
+                                            old_content.extra_fields[field_name]
+                                        )
                     else:
                         resolved_op.uris = self._isolation_handler.calculate_memory_uris(
                             memory_type_schema=schema,
@@ -503,7 +664,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
         so that existing files discovered by refetch get 1-99 page_ids
         instead of 100+ IDs from register_new_page_id.
         """
-        if not self._link_enabled:
+        if not self._link_enabled or operations.has_errors():
             return
 
         upsert_operations = operations.upsert_operations
@@ -795,6 +956,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     )
                     return (None, None)
 
+                self._last_successful_llm_content = content
                 return (None, operations)
             except Exception as e:
                 logger.exception(f"Error parsing operations: {e}")
@@ -928,9 +1090,121 @@ The final output of the model must strictly follow the JSON Schema format shown 
             "If you copy from numbered read output, exclude the `line_number<TAB>` prefix from SEARCH and REPLACE text. "
             "If found_in_other_uris is non-empty, diagnose this as a possible page_id mismatch and choose the correct target page_id or rewrite the patch for the current page_id; do not silently move the patch. "
             "Regenerate the complete operations JSON, including previous successful operations and fixed failed operations. "
+            "For every experience operation, keep supersedes empty and do not emit delete_ids or replacement_page_id; repair only an exact in-place update or create a separate experience while leaving existing and legacy files unchanged. "
             "Output ONLY the complete JSON object matching the required schema.\n\n"
             f"Failed patch operations:\n{details}"
         )
+
+    def _build_experience_repair_instruction(
+        self, experience_errors: List[Dict[str, Any]]
+    ) -> str:
+        details = json.dumps(experience_errors, ensure_ascii=False, indent=2)
+        return (
+            "Experience operations failed the deterministic atomic-memory policy. "
+            "Regenerate the complete operations JSON and preserve every valid operation. "
+            "Use exactly ## Situation, ## Approach, and ## Reflect with only '- ' bullets. "
+            "Keep the body at or below 3000 characters, Situation at or below 3 bullets, "
+            "Approach at or below 8, Reflect at or below 8, and each bullet at or below 400 characters. "
+            "Remove duplicate rules across sections. If the material does not fit, emit multiple "
+            "narrowly named experiences—one user intent and tool sequence per experience. "
+            "Set every supersedes value to the empty string and keep delete_ids empty; never emit "
+            "replacement_page_id or delete, replace, rename, merge, or supersede an existing or "
+            "legacy experience. Repair only an exact in-place update or create a separate bounded "
+            "experience. Output ONLY the complete JSON object.\n\n"
+            f"Policy violations:\n{details}"
+        )
+
+    @staticmethod
+    def _experience_policy_error_targets_operation(
+        error: Dict[str, Any], operation: ResolvedOperation
+    ) -> bool:
+        fields = operation.memory_fields or {}
+        return (
+            error.get("page_id") == operation.page_id
+            and list(error.get("uris") or []) == list(operation.uris or [])
+            and error.get("experience_name") == fields.get("experience_name")
+        )
+
+    @staticmethod
+    def _snapshot_experience_operation(operation: ResolvedOperation) -> Dict[str, Any]:
+        return {
+            "memory_type": operation.memory_type,
+            "page_id": operation.page_id,
+            "uris": list(operation.uris or []),
+            "memory_fields": copy.deepcopy(operation.memory_fields or {}),
+        }
+
+    def _capture_valid_experience_siblings(
+        self,
+        operations: List[ResolvedOperation],
+        policy_errors: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return [
+            self._snapshot_experience_operation(operation)
+            for operation in operations
+            if operation.memory_type == "experiences"
+            and not any(
+                self._experience_policy_error_targets_operation(error, operation)
+                for error in policy_errors
+            )
+        ]
+
+    @staticmethod
+    def _experience_snapshot_identity(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        fields = snapshot.get("memory_fields") or {}
+        return {
+            "memory_type": snapshot.get("memory_type"),
+            "experience_name": fields.get("experience_name"),
+            "uris": list(snapshot.get("uris") or []),
+        }
+
+    def _validate_preserved_experience_siblings(
+        self,
+        preserved: List[Dict[str, Any]],
+        operations: List[ResolvedOperation],
+    ) -> List[Dict[str, Any]]:
+        remaining = [
+            self._snapshot_experience_operation(operation)
+            for operation in operations
+            if operation.memory_type == "experiences"
+        ]
+        errors: List[Dict[str, Any]] = []
+        for expected in preserved:
+            exact_index = next(
+                (index for index, candidate in enumerate(remaining) if candidate == expected),
+                None,
+            )
+            if exact_index is not None:
+                remaining.pop(exact_index)
+                continue
+
+            identity = self._experience_snapshot_identity(expected)
+            altered_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(remaining)
+                    if self._experience_snapshot_identity(candidate) == identity
+                ),
+                None,
+            )
+            observed_page_id = None
+            if altered_index is not None:
+                observed_page_id = remaining.pop(altered_index).get("page_id")
+            errors.append(
+                {
+                    **identity,
+                    "page_id": expected.get("page_id"),
+                    "status": "altered" if altered_index is not None else "omitted",
+                    "observed_page_id": observed_page_id,
+                }
+            )
+        return errors
+
+    def _append_last_successful_proposal(self, messages: List[Dict[str, Any]]) -> None:
+        """Keep the rejected complete proposal in context for the repair attempt."""
+        proposal = (self._last_successful_llm_content or "").strip()
+        if proposal:
+            messages.append({"role": "assistant", "content": proposal})
 
     async def _add_refetch_results_to_messages(
         self,

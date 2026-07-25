@@ -42,7 +42,10 @@ fields:
       - FAILURE INTEGRATION: Translate past mistakes into strict negative constraints. These MUST be placed exclusively in the 'Reflect' section.
       - EXECUTION-FIRST PRINCIPLE: 'Approach' steps MUST describe direct tool invocations only. Strip all "I will now do X" / "I have completed X" communication steps.
       - CONDITIONAL BRANCH PRESERVATION: Capture full decision trees as explicit IF/THEN/ELSE branches. NEVER collapse divergent user-driven branches into a single terminal action.
-      - ATOMIC SCOPE: Each experience MUST cover exactly ONE user intent and its associated tool-invocation sequence. Multiple distinct user intents → SEPARATE experiences. A 'Situation' listing more than one user goal is a violation: split immediately. Hard limit: if 'Approach' would exceed 8 bullets, STOP and split.
+      - ATOMIC SCOPE: Each experience MUST cover exactly ONE user intent and its associated tool-invocation sequence. Multiple distinct user intents → SEPARATE experiences. A 'Situation' listing more than one user goal is a violation: split immediately.
+      - ENFORCED SIZE LIMITS: The complete body MUST be at most 3000 characters. Situation MUST have at most 3 bullets, Approach at most 8, Reflect at most 8, and each bullet at most 400 characters. If any limit would be exceeded, STOP and split into narrowly named experiences.
+      - UPDATE DISCIPLINE: Do not copy a candidate experience wholesale. Update it only when the user intent and operational sequence are the same. A distinct failure mode requires a separate experience.
+      - AUTOMATED SUPERSESSION IS DISABLED: Always emit `supersedes` as the empty string and never emit experience `delete_ids` or `replacement_page_id` entries. Existing and legacy experiences may be changed only by an exact in-place update; otherwise create a separate bounded experience and leave the existing file unchanged for an explicit administrative migration.
       - STRICT FORMATTING: Use exactly the 3 headings above in this order. Use concise markdown bullets (-) for every section. No numbered lists, no introductory sentences, no conversational filler, and no closing paragraphs. Token efficiency is critical.
 
     merge_op: replace
@@ -50,8 +53,7 @@ fields:
   - name: supersedes
     type: string
     description: |
-      The experience_name of an existing experience that this one supersedes.
-      Set ONLY when this experience replaces a narrower existing experience with a DIFFERENT name.
-      The system will automatically delete the old experience and inherit its trajectory history.
-      Leave empty for a new experience or when updating an experience with the same name.
+      Reserved exclusively for an explicit, separately verified administrative migration.
+      Automated extraction MUST always emit the empty string ("").
+      NEVER use this field to delete, rename, replace, or supersede an existing or legacy experience.
     merge_op: replace

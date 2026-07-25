@@ -9,7 +9,7 @@ Maintains the service-facing compressor interface.
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from openviking.core.context import Context
@@ -18,11 +18,9 @@ from openviking.server.identity import RequestContext
 from openviking.session.memory import ExtractLoop, MemoryUpdater
 from openviking.session.memory.constants import EXECUTION_MEMORY_TYPES
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations, StoredLink
+from openviking.session.memory.experience_policy import validate_experience_operations
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.memory_updater import (
-    MemoryUpdateResult,
-    write_stored_links,
-)
+from openviking.session.memory.memory_updater import MemoryUpdateResult
 from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import render_template
@@ -587,33 +585,6 @@ class SessionCompressorV2:
                 trajectory_summary=traj_content,
                 trajectory_uri=traj_uri,
             )
-            exp_dir = exp_provider._render_experience_dir(ctx)
-
-            async def _append_sources_before_unlock(
-                result: MemoryUpdateResult,
-                inheritance_map: Dict[str, List[str]],
-                lock_handle: Any,
-                exp_provider=exp_provider,
-                exp_dir=exp_dir,
-                traj_uri=traj_uri,
-            ) -> None:
-                all_exp_uris = await self._resolve_source_target_experience_uris(
-                    result=result,
-                    provider=exp_provider,
-                    exp_dir=exp_dir,
-                    ctx=ctx,
-                    viking_fs=viking_fs,
-                )
-                for exp_uri in all_exp_uris:
-                    inherited = inheritance_map.get(exp_uri, [])
-                    source_uris = list(dict.fromkeys([traj_uri] + inherited))
-                    await self._append_trajectories_to_experiences(
-                        [exp_uri],
-                        source_uris,
-                        ctx,
-                        viking_fs,
-                        lock_handle=lock_handle,
-                    )
 
             exp_result = await self._run_extract_phase(
                 provider=exp_provider,
@@ -621,23 +592,10 @@ class SessionCompressorV2:
                 ctx=ctx,
                 strict_extract_errors=strict_extract_errors,
                 phase_label=f"experience({traj_uri})",
-                post_apply=_append_sources_before_unlock,
                 allowed_memory_types=allowed_execution_types,
                 thinking=True,
             )
             if exp_result is None:
-                fallback_uris = await self._single_existing_experience_uris(
-                    exp_dir=exp_dir,
-                    ctx=ctx,
-                    viking_fs=viking_fs,
-                )
-                if fallback_uris:
-                    tracer.info(
-                        f"[source_traj] phase2 failed; fallback append to sole experience: {fallback_uris[0]}"
-                    )
-                    await self._append_trajectories_to_experiences(
-                        fallback_uris, [traj_uri], ctx, viking_fs
-                    )
                 continue
 
             _, _, exp_contexts, _, _ = exp_result
@@ -647,70 +605,43 @@ class SessionCompressorV2:
             "session_skills": session_skill_results,
         }
 
-    async def _resolve_source_target_experience_uris(
-        self,
-        *,
-        result: MemoryUpdateResult,
-        provider: Any,
-        exp_dir: str,
-        ctx: RequestContext,
-        viking_fs,
-    ) -> List[str]:
-        all_exp_uris = list(result.written_uris) + list(result.edited_uris)
-        if all_exp_uris:
-            return all_exp_uris
+    @staticmethod
+    def _inject_experience_source_links(operations: ResolvedOperations, provider: Any) -> None:
+        """Attach system-managed experience provenance before the updater publishes.
 
-        candidate_uris = list(dict.fromkeys(getattr(provider, "prefetched_uris", []) or []))
-        candidate_exp_uris = [
-            uri
-            for uri in candidate_uris
-            if uri.endswith(".md")
-            and not uri.endswith("/.overview.md")
-            and not uri.endswith("/.abstract.md")
-            and "/memories/experiences/" in uri
-        ]
-        if len(candidate_exp_uris) == 1:
-            tracer.info(
-                f"[source_traj] fallback append to sole candidate experience: {candidate_exp_uris[0]}"
-            )
-            return candidate_exp_uris
+        The updater owns the compensated two-endpoint write, error reporting, and
+        experience publication gate. Keeping the relation in ``resolved_links``
+        prevents a later callback from exposing an experience before its trajectory
+        backlink is durable.
+        """
+        trajectory_uri = str(getattr(provider, "trajectory_uri", "") or "").strip()
+        if not trajectory_uri:
+            return
 
-        existing = await self._single_existing_experience_uris(
-            exp_dir=exp_dir,
-            ctx=ctx,
-            viking_fs=viking_fs,
-        )
-        if existing:
-            tracer.info(f"[source_traj] fallback append by directory scan: {existing[0]}")
-        return existing
-
-    async def _single_existing_experience_uris(
-        self,
-        *,
-        exp_dir: str,
-        ctx: RequestContext,
-        viking_fs,
-    ) -> List[str]:
-        if not exp_dir:
-            return []
-        try:
-            entries = await viking_fs.ls(exp_dir, output="original", ctx=ctx)
-        except Exception:
-            return []
-
-        uris: List[str] = []
-        for entry in entries or []:
-            uri = str(entry.get("uri", "")) if isinstance(entry, dict) else ""
-            name = str(entry.get("name", "")) if isinstance(entry, dict) else ""
-            if not uri.endswith(".md"):
+        resolved_links = list(getattr(operations, "resolved_links", []) or [])
+        existing = {
+            (link.from_uri, link.to_uri, link.link_type)
+            for link in resolved_links
+        }
+        created_at = datetime.now(timezone.utc).isoformat()
+        for operation in operations.upsert_operations:
+            if operation.memory_type != "experiences":
                 continue
-            if name in {".overview.md", ".abstract.md"}:
-                continue
-            if uri.endswith("/.overview.md") or uri.endswith("/.abstract.md"):
-                continue
-            uris.append(uri)
-        uris = list(dict.fromkeys(uris))
-        return uris if len(uris) == 1 else []
+            for experience_uri in operation.uris:
+                key = (experience_uri, trajectory_uri, "derived_from")
+                if not experience_uri or key in existing:
+                    continue
+                resolved_links.append(
+                    StoredLink(
+                        from_uri=experience_uri,
+                        to_uri=trajectory_uri,
+                        link_type="derived_from",
+                        weight=1.0,
+                        created_at=created_at,
+                    )
+                )
+                existing.add(key)
+        operations.resolved_links = resolved_links
 
     async def _run_extract_phase(
         self,
@@ -726,9 +657,8 @@ class SessionCompressorV2:
         """Run one ExtractLoop phase with its own lock scope, then apply operations.
 
         Returns (written_uris, edited_uris, contexts, inheritance_map, session_skill_results)
-        on success, where inheritance_map maps new experience URI → inherited
-        source_trajectory URIs (only populated for experiences that supersede an
-        existing one).
+        on success. ``inheritance_map`` is retained for callback compatibility and
+        remains empty because automated experience supersession is disabled.
         Returns None on failure (unless strict_extract_errors is True, in which case
         the exception is re-raised).
         """
@@ -833,10 +763,10 @@ class SessionCompressorV2:
                 f"[{phase_label}] LLM operations: ops={_op_items}, delete_uris={_delete_uris_raw}"
             )
 
-            # Resolve supersedes fields (name-based Replace): find old experience URI,
-            # queue for deletion, and return per-URI inheritance map so only the
-            # superseding experience inherits the old source_trajectories.
+            # Automated experience supersession is disabled. Reject and strip any
+            # supersession/deletion request before applying the operation batch.
             inheritance_map = await self._resolve_supersedes(operations, ctx, viking_fs, provider)
+            self._inject_experience_source_links(operations, provider)
 
             memory_operations, skill_operations, unsupported_skill_deletes = (
                 self._split_operations_by_memory_type(operations)
@@ -869,7 +799,11 @@ class SessionCompressorV2:
                 f"errors={len(memory_result.errors)}"
             )
 
-            if post_apply:
+            if (
+                post_apply
+                and not memory_result.errors
+                and (memory_result.written_uris or memory_result.edited_uris)
+            ):
                 await post_apply(memory_result, inheritance_map, transaction_handle)
 
             skill_results: List[Dict[str, Any]] = []
@@ -895,17 +829,31 @@ class SessionCompressorV2:
                     )
                 skill_results = list(skill_result.operation_results)
 
+            experience_publication_failed = bool(memory_result.errors) and any(
+                operation.memory_type == "experiences"
+                for operation in memory_operations.upsert_operations
+            )
+            published_written_uris = (
+                [] if experience_publication_failed else list(memory_result.written_uris)
+            )
+            published_edited_uris = (
+                [] if experience_publication_failed else list(memory_result.edited_uris)
+            )
+            published_deleted_uris = (
+                [] if experience_publication_failed else list(memory_result.deleted_uris)
+            )
+
             contexts: List[Context] = []
-            for uri in memory_result.written_uris:
+            for uri in published_written_uris:
                 contexts.append(Context(uri=uri, category="memory_write", context_type="memory"))
-            for uri in memory_result.edited_uris:
+            for uri in published_edited_uris:
                 contexts.append(Context(uri=uri, category="memory_edit", context_type="memory"))
-            for uri in memory_result.deleted_uris:
+            for uri in published_deleted_uris:
                 contexts.append(Context(uri=uri, category="memory_delete", context_type="memory"))
 
             return (
-                list(memory_result.written_uris),
-                list(memory_result.edited_uris),
+                published_written_uris,
+                published_edited_uris,
                 contexts,
                 inheritance_map,
                 skill_results,
@@ -929,162 +877,61 @@ class SessionCompressorV2:
         viking_fs,
         provider,
     ) -> Dict[str, List[str]]:
-        """Resolve supersedes fields in experience upsert operations.
+        """Reject automated experience supersession/deletion without reading legacy files.
 
-        For each experience with a non-empty `supersedes` field, find the old
-        experience file by name, append it to delete_file_contents so
-        apply_operations handles deletion uniformly, then pop `supersedes` from
-        memory_fields so it is not written to disk.
-
-        Returns a mapping from new experience URI → inherited source_trajectory URIs,
-        so the caller can apply inherited trajectories only to the superseding experience,
-        not to every experience written in the same batch.
+        ``supersedes`` is reserved for an explicit administrative migration. Session
+        extraction therefore fails the whole memory batch closed if the model requests
+        one, strips the field before persistence, and removes experience deletion intents
+        as a second line of defense. No legacy source is read or mutated here.
         """
-        from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+        del ctx, viking_fs, provider
 
-        inheritance_map: Dict[str, List[str]] = {}
+        validation_errors = validate_experience_operations(operations.upsert_operations)
+        if validation_errors:
+            operations.errors.append(
+                "Experience admission preflight failed: "
+                + json.dumps(validation_errors, ensure_ascii=False)
+            )
 
-        exp_dir: str = ""
-        if hasattr(provider, "_render_experience_dir"):
-            exp_dir = provider._render_experience_dir(ctx) or ""
-
+        requested_supersedes: List[str] = []
         for op in operations.upsert_operations:
             if op.memory_type != "experiences":
                 continue
-            supersedes_name = (op.memory_fields.pop("supersedes", None) or "").strip()
-            if not supersedes_name:
-                continue
-            if not exp_dir:
-                logger.warning(
-                    f"[supersedes] cannot resolve '{supersedes_name}': no experience dir"
-                )
-                continue
+            supersedes_name = str(op.memory_fields.pop("supersedes", "") or "").strip()
+            if supersedes_name:
+                requested_supersedes.append(supersedes_name)
 
-            old_uri = f"{exp_dir.rstrip('/')}/{supersedes_name}.md"
+        def _targets_experience(memory_file: MemoryFile) -> bool:
+            uri = str(memory_file.uri or "").replace("\\", "/").casefold()
+            return memory_file.memory_type == "experiences" or "/memories/experiences/" in uri
 
-            # Derive the new URI from experience_name (filename_template: "{{ experience_name }}.md")
-            new_name = (op.memory_fields.get("experience_name") or "").strip()
-            new_uri = f"{exp_dir.rstrip('/')}/{new_name}.md" if new_name else None
-
-            # Guard: never delete the file we are about to write (same-name edge case)
-            if old_uri == new_uri or old_uri in (op.uris or []):
-                tracer.info(f"[supersedes] skipping self-reference: {old_uri}")
-                continue
-
-            try:
-                raw = await viking_fs.read_file(old_uri, ctx=ctx) or ""
-                old_mf = MemoryFileUtils.read(raw, uri=old_uri)
-                operations.delete_file_contents.append(old_mf)
-                tracer.info(f"[supersedes] '{supersedes_name}' → queued for delete: {old_uri}")
-
-                # Inherit traj URIs from old exp's links (exp→traj, derived_from) to the new URI only.
-                if new_uri:
-                    inherited = [
-                        link.get("to_uri", "")
-                        for link in old_mf.links
-                        if link.get("link_type") == "derived_from" and link.get("to_uri", "")
-                    ]
-                    if inherited:
-                        inheritance_map[new_uri] = inherited
-            except Exception as e:
-                logger.warning(f"[supersedes] failed to read '{old_uri}': {e}")
-
-        return inheritance_map
-
-    async def _append_trajectories_to_experiences(
-        self,
-        exp_uris: List[str],
-        traj_uris: List[str],
-        ctx,
-        viking_fs,
-        lock_handle: Optional[Any] = None,
-    ) -> None:
-        """Write bidirectional StoredLinks between traj_uris and each exp file.
-
-        Called after experience write/edit. The LLM never outputs these links;
-        the pipeline appends them so the relationship is always system-managed.
-        """
-        normalized_traj_uris = [uri for uri in traj_uris if uri]
-        if not normalized_traj_uris:
-            return
-
-        for exp_uri in exp_uris:
-            try:
-                try:
-                    from openviking.storage.transaction import LockContext, get_lock_manager
-
-                    lock_manager = get_lock_manager()
-                except Exception:
-                    await self._append_trajectory_metadata(
-                        exp_uri,
-                        normalized_traj_uris,
-                        ctx,
-                        viking_fs,
-                    )
-                    continue
-
-                lock_path = viking_fs._uri_to_path(exp_uri, ctx=ctx)
-                async with LockContext(
-                    lock_manager,
-                    [lock_path],
-                    lock_mode="exact",
-                    handle=lock_handle,
-                ) as active_lock_handle:
-                    await self._append_trajectory_metadata(
-                        exp_uri,
-                        normalized_traj_uris,
-                        ctx,
-                        viking_fs,
-                        lock_handle=active_lock_handle,
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to append source trajectories to {exp_uri}: {e}")
-
-    async def _append_trajectory_metadata(
-        self,
-        exp_uri: str,
-        traj_uris: List[str],
-        ctx,
-        viking_fs,
-        lock_handle=None,
-    ) -> None:
-        from datetime import timezone
-
-        from openviking.session.memory.merge_op.link_merge import merge_links
-
-        raw = await viking_fs.read_file(exp_uri, ctx=ctx) or ""
-        mf = MemoryFileUtils.read(raw, uri=exp_uri)
-
-        # exp→traj: one directed edge per trajectory.
-        # write_stored_links writes it to exp.links (forward) and traj.backlinks (reverse) automatically.
-        now = datetime.now(timezone.utc).isoformat()
-        links = [
-            StoredLink(
-                from_uri=exp_uri, to_uri=t, link_type="derived_from", weight=1.0, created_at=now
-            )
-            for t in traj_uris
+        experience_deletes = [
+            memory_file
+            for memory_file in operations.delete_file_contents
+            if _targets_experience(memory_file)
         ]
+        if experience_deletes:
+            operations.delete_file_contents = [
+                memory_file
+                for memory_file in operations.delete_file_contents
+                if not _targets_experience(memory_file)
+            ]
 
-        new_exp_links = merge_links(mf.links, [l.model_dump() for l in links])
-        links_changed = len(new_exp_links) != len(mf.links)
-        mf.links = new_exp_links
+        experience_replacement_uris = [
+            source_uri
+            for source_uri in operations.delete_replacements
+            if "/memories/experiences/" in str(source_uri or "").replace("\\", "/").casefold()
+        ]
+        for source_uri in experience_replacement_uris:
+            operations.delete_replacements.pop(source_uri, None)
 
-        if links_changed:
-            # TODO: This must be optimized once pathlock is pushed down into ragfs.
-            await viking_fs.write_file(
-                exp_uri,
-                MemoryFileUtils.write(mf),
-                ctx=ctx,
-                lock_handle=lock_handle,
+        if requested_supersedes or experience_deletes or experience_replacement_uris:
+            operations.errors.append(
+                "Automatic experience deletion or supersession is disabled; keep "
+                "supersedes empty and leave existing and legacy experiences unchanged."
             )
-            tracer.info(
-                f"[agent_link] wrote exp→traj links -> {exp_uri} (traj_count={len(traj_uris)})"
-            )
-        else:
-            tracer.info(f"[agent_link] links already present, skip: {exp_uri}")
 
-        # Write traj.backlinks — exp_uri already handled above
-        await write_stored_links(links, ctx, viking_fs, skip_uris={exp_uri})
+        return {}
 
     async def _build_memory_diff(
         self,

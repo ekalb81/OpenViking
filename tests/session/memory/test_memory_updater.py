@@ -580,14 +580,14 @@ class TestMemoryUpdater:
 
     @pytest.mark.asyncio
     async def test_apply_operations_skips_link_updates_for_deleted_uris(self, monkeypatch):
-        deleted_uri = "viking://user/user_sample_3/memories/experiences/old.md"
-        written_uri = "viking://user/user_sample_3/memories/experiences/new.md"
+        deleted_uri = "viking://user/alice/memories/events/old.md"
+        written_uri = "viking://user/alice/memories/events/new.md"
 
         schema = MemoryTypeSchema(
-            memory_type="experiences",
-            description="experience memory",
-            directory="viking://user/{{ user_space }}/memories/experiences",
-            filename_template="{{ experience_name }}.md",
+            memory_type="events",
+            description="event memory",
+            directory="viking://user/{{ user_space }}/memories/events",
+            filename_template="{{ event_name }}.md",
             fields=[],
             overview_template="overview",
         )
@@ -612,13 +612,13 @@ class TestMemoryUpdater:
         resolved = ResolvedOperations(
             upsert_operations=[
                 ResolvedOperation(
-                    memory_fields={"experience_name": "new"},
-                    memory_type="experiences",
+                    memory_fields={"event_name": "new", "summary": "new event"},
+                    memory_type="events",
                     uris=[written_uri],
                 )
             ],
             delete_file_contents=[
-                MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "experiences"})
+                MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "events"})
             ],
             errors=[],
             resolved_links=[
@@ -647,6 +647,7 @@ class TestMemoryUpdater:
         assert deleted_uri not in [
             call.args[0] for call in mock_viking_fs.read_file.await_args_list
         ]
+        mock_viking_fs.write_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_apply_operations_skips_case_only_delete_conflicting_with_upsert(self):
@@ -809,7 +810,15 @@ class TestMemoryUpdater:
         registry = MagicMock()
         registry.get.return_value = schema
 
-        store = {}
+        store = {
+            profile_uri: MemoryFileUtils.write(
+                MemoryFile(
+                    uri=profile_uri,
+                    content="Caroline profile",
+                    memory_type="profile",
+                )
+            ),
+        }
         mock_viking_fs = MagicMock()
 
         async def mock_read_file(uri, **kwargs):

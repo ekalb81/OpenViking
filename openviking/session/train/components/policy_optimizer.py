@@ -72,6 +72,7 @@ class PatchMergePolicyOptimizer:
                     "memory_type": self.memory_type,
                     "gradient_count": len(gradients),
                     "patch_gradient_count": 0,
+                    "merge_errors": [],
                 },
             )
 
@@ -100,6 +101,7 @@ class PatchMergePolicyOptimizer:
                 "memory_type": self.memory_type,
                 "gradient_count": len(gradients),
                 "patch_gradient_count": len(patch_gradients),
+                "merge_errors": list(operations.errors),
                 "gradients": [
                     _gradient_to_dict(idx, gradient)
                     for idx, gradient in enumerate(patch_gradients)
@@ -391,6 +393,9 @@ def _operations_to_plan_items(
     policy_set: PolicySet,
     memory_type: str,
 ) -> list[PolicyPlanItem]:
+    if memory_type.casefold() == "experiences" and list(getattr(operations, "errors", []) or []):
+        return []
+
     items: list[PolicyPlanItem] = []
     source_links_by_target = _source_trajectory_links_by_target(gradients, policy_set)
     superseded_policies = _superseded_policies_for_gradients(gradients, policy_set)
@@ -457,6 +462,12 @@ def _operations_to_plan_items(
         )
         if target_uri:
             upsert_target_uris.add(target_uri)
+
+    # Experience training is additive/update-only.  Legacy experience sources require a
+    # separately verified migration, so optimizer output must never turn either model-requested
+    # deletes or semantic-gradient supersession hints into automatic delete plan items.
+    if memory_type.casefold() == "experiences":
+        return items
 
     delete_uris: set[str] = set()
     for old_file in getattr(operations, "delete_file_contents", []) or []:

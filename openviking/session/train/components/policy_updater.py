@@ -15,6 +15,7 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.experience_policy import validate_experience_operations
 from openviking.session.memory.memory_type_registry import create_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.train.domain import (
@@ -52,19 +53,44 @@ class DryRunPolicyUpdater:
     ) -> PolicyApplyResult:
         del transaction_handle
         del context
-        updated_policy_set = (
-            _apply_items_to_snapshot(plan.items, policy_set)
-            if self.simulate and plan.items
-            else policy_set
+        merge_errors = _plan_merge_errors(plan)
+        if merge_errors:
+            return PolicyApplyResult(
+                updated_policy_set=policy_set,
+                errors=merge_errors,
+                metadata={
+                    "dry_run": True,
+                    "simulated": self.simulate,
+                    "plan": plan.metadata,
+                    "item_count": len(plan.items),
+                    "validation_error_count": len(merge_errors),
+                },
+            )
+
+        updated_policy_set = _apply_items_to_snapshot(plan.items, policy_set)
+        operations, preflight_errors = _plan_to_resolved_operations(
+            plan=plan,
+            policy_set=policy_set,
+            updated_policy_set=updated_policy_set,
+        )
+        experience_errors = validate_experience_operations(operations.upsert_operations)
+        errors = [
+            *preflight_errors,
+            *[error["message"] for error in experience_errors],
+        ]
+        simulated_policy_set = (
+            updated_policy_set if self.simulate and plan.items and not errors else policy_set
         )
         return PolicyApplyResult(
-            updated_policy_set=updated_policy_set,
+            updated_policy_set=simulated_policy_set,
             written_uris=[],
+            errors=errors,
             metadata={
                 "dry_run": True,
                 "simulated": self.simulate,
                 "plan": plan.metadata,
                 "item_count": len(plan.items),
+                "validation_error_count": len(errors),
             },
         )
 
@@ -91,6 +117,19 @@ class MemoryFilePolicyUpdater:
         *,
         transaction_handle: Any = None,
     ) -> PolicyApplyResult:
+        merge_errors = _plan_merge_errors(plan)
+        if merge_errors:
+            return PolicyApplyResult(
+                updated_policy_set=policy_set,
+                errors=merge_errors,
+                metadata={
+                    "dry_run": False,
+                    "item_count": len(plan.items),
+                    "operation_upsert_count": 0,
+                    "operation_delete_count": 0,
+                },
+            )
+
         viking_fs = self.viking_fs or get_viking_fs()
         if viking_fs is None:
             raise RuntimeError("VikingFS is required to apply policy update plans")
@@ -101,6 +140,17 @@ class MemoryFilePolicyUpdater:
             policy_set=policy_set,
             updated_policy_set=updated_policy_set,
         )
+        if preflight_errors:
+            return PolicyApplyResult(
+                updated_policy_set=policy_set,
+                errors=preflight_errors,
+                metadata={
+                    "dry_run": False,
+                    "item_count": len(plan.items),
+                    "operation_upsert_count": len(operations.upsert_operations),
+                    "operation_delete_count": len(operations.delete_file_contents),
+                },
+            )
         updater = MemoryUpdater(
             registry=create_default_registry(),
             vikingdb=self.vikingdb,
@@ -126,8 +176,18 @@ class MemoryFilePolicyUpdater:
                 "item_count": len(plan.items),
                 "operation_upsert_count": len(operations.upsert_operations),
                 "operation_delete_count": len(operations.delete_file_contents),
+                "index_pending_uris": list(
+                    getattr(apply_result, "index_pending_uris", []) or []
+                ),
             },
         )
+
+
+def _plan_merge_errors(plan: PolicyUpdatePlan) -> list[str]:
+    errors = plan.metadata.get("merge_errors", [])
+    if isinstance(errors, str):
+        return [errors] if errors else []
+    return [str(error) for error in errors or []]
 
 
 def _apply_items_to_snapshot(
@@ -253,6 +313,10 @@ def _plan_to_resolved_operations(
             continue
 
         if item.kind == "delete":
+            delete_memory_type = item.memory_type or "experiences"
+            if delete_memory_type.casefold() == "experiences":
+                errors.append(f"automatic experience delete is disabled: {item.target_name}")
+                continue
             deletes.append(_policy_or_plan_item_memory_file(item, uri=uri, current=current))
             continue
 
