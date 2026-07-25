@@ -232,3 +232,22 @@ async def test_provider_failure_does_not_fabricate_a_pass():
 
     assert evaluation.passed is False
     assert evaluation.metadata["verified_correction_count"] == 0
+
+
+def test_production_compressor_wires_a_real_evaluator(monkeypatch):
+    """Without an evaluator the analysis falls back to a fabricated passed=True.
+
+    ``_evaluation_from_trajectories`` reports success whenever a trajectory file was written, and
+    ``gradient_estimator._confidence`` adds +0.2 for it — so an unwired analyzer silently inflates the
+    confidence of every distilled experience. This pins the wiring rather than the default.
+    """
+    from openviking.session import compressor_v3
+
+    # The analyzer is built against a live VikingFS; a unit test has no business standing one up.
+    monkeypatch.setattr(compressor_v3, "get_viking_fs", lambda: None)
+
+    compressor = compressor_v3.SessionCompressorV3(vikingdb=None, rollout_analyzer=None)
+
+    evaluator = compressor.rollout_analyzer.evaluator
+    assert evaluator is not None, "analyzer would fall back to the fabricated passed=True evaluation"
+    assert isinstance(evaluator, SessionCorrectionEvaluator)

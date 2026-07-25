@@ -18,6 +18,10 @@ from openviking.session.train.components.event_recorder import (
     JsonlEventRecorder,
     JsonlPipelineEventHook,
 )
+from openviking.session.train.components.correction_evaluator import (
+    CorrectionEvent,
+    SessionCorrectionEvaluator,
+)
 from openviking.session.train.components.gradient_estimator import (
     ExperienceGradientContext,
     ExperienceGradientEstimator,
@@ -126,6 +130,8 @@ __all__ = [
     "StreamingPolicyTrainerConfig",
     "StreamingPolicyTrainer",
     "BatchPolicyTrainer",
+    "CorrectionEvent",
+    "SessionCorrectionEvaluator",
     "ExperienceGradientEstimator",
     "ExperienceGradientContext",
     "TrajectoryRolloutAnalyzer",

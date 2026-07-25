@@ -62,6 +62,7 @@ from openviking.session.train import (
     RolloutTrainingResult,
     Rubric,
     RubricCriterion,
+    SessionCorrectionEvaluator,
     SkillPolicyUpdater,
     SkillSetLoader,
     StreamingPolicyTrainerConfig,
@@ -134,9 +135,16 @@ class SessionCompressorV3:
     ):
         self.vikingdb = vikingdb
         self.skill_processor = skill_processor
+        # The analyzer shipped with evaluator=None, so _evaluate_rollout returned None and the analysis
+        # fell back to _evaluation_from_trajectories — which reports passed=True whenever any trajectory
+        # file was written. That is a success claim resting on the existence of a file, and it feeds
+        # gradient_estimator._confidence as a +0.2 weight, so every distilled experience has been carrying
+        # confidence it never earned. Supplying a real evaluator displaces that fallback and makes
+        # inject_evaluation_feedback live, so extraction sees the verified correction before it distils.
         self.rollout_analyzer = rollout_analyzer or TrajectoryRolloutAnalyzer(
             viking_fs=get_viking_fs(),
             vikingdb=vikingdb,
+            evaluator=SessionCorrectionEvaluator(),
         )
         self.streaming_trainer_config = streaming_trainer_config or StreamingPolicyTrainerConfig()
         self.streaming_memory_updater_config = (
