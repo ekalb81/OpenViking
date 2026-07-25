@@ -144,6 +144,7 @@ By default the plugin derives a peer from the workspace path using Claude's proj
 |----------------------------------------|--------------|--------------------------------------------------------------------------|
 | `OPENVIKING_AUTO_RECALL`               | `true`       | Enable auto-recall on every user prompt                                  |
 | `OPENVIKING_RECALL_LIMIT`              | `6`          | Max memories to inject per turn                                          |
+| `OPENVIKING_RECALL_EXPERIENCES`        | `3`          | Reserved quota for distilled procedural experiences; set `0` to disable |
 | `OPENVIKING_RECALL_TOKEN_BUDGET`       | `2000`       | Token budget for inline content; over-budget items degrade to URI hints  |
 | `OPENVIKING_RECALL_MAX_CONTENT_CHARS`  | `500`        | Per-item content cap                                                     |
 | `OPENVIKING_RECALL_PREFER_ABSTRACT`    | `true`       | Prefer abstract over full body when available                            |
@@ -189,6 +190,7 @@ OPENVIKING_API_KEY=sk-xxx \
 OPENVIKING_ACCOUNT=my-team \
 OPENVIKING_USER=alice \
 OPENVIKING_RECALL_LIMIT=8 \
+OPENVIKING_RECALL_EXPERIENCES=3 \
 claude
 ```
 

@@ -143,6 +143,7 @@ claude
 |----------------------------------------|---------------|--------------------------------------------------------------------|
 | `OPENVIKING_AUTO_RECALL`               | `true`        | 启用每轮自动召回                                                   |
 | `OPENVIKING_RECALL_LIMIT`              | `6`           | 每轮最多注入的记忆条数                                             |
+| `OPENVIKING_RECALL_EXPERIENCES`        | `3`           | 蒸馏经验的独立召回配额；设为 `0` 可禁用                            |
 | `OPENVIKING_RECALL_TOKEN_BUDGET`       | `2000`        | 内联内容的 token 预算；超出预算的项降级为 URI hint                  |
 | `OPENVIKING_RECALL_MAX_CONTENT_CHARS`  | `500`         | 单条记忆内容字符上限                                               |
 | `OPENVIKING_RECALL_PREFER_ABSTRACT`    | `true`        | 有 abstract 时优先用 abstract 而非完整 body                        |
@@ -185,6 +186,7 @@ OPENVIKING_API_KEY=sk-xxx \
 OPENVIKING_ACCOUNT=my-team \
 OPENVIKING_USER=alice \
 OPENVIKING_RECALL_LIMIT=8 \
+OPENVIKING_RECALL_EXPERIENCES=3 \
 claude
 ```
 

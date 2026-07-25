@@ -118,6 +118,7 @@ All plugin behavior is controlled by `OPENVIKING_*` environment variables. Conne
 ```sh
 # ~/.zshrc — examples
 export OPENVIKING_RECALL_LIMIT=6
+export OPENVIKING_RECALL_EXPERIENCES=3
 export OPENVIKING_RECALL_COMPRESS=1
 export OPENVIKING_RECALL_COMPRESS_MODEL=gpt-5.3-codex-spark
 export OPENVIKING_RECALL_COMPRESS_THINKING=default

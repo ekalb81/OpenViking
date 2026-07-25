@@ -32,7 +32,7 @@
  *   OPENVIKING_TIMEOUT_MS, OPENVIKING_CAPTURE_TIMEOUT_MS
  *   OPENVIKING_RECALL_TIMEOUT_MS, OPENVIKING_RECALL_COMPRESS_TIMEOUT_MS
  *   OPENVIKING_RECALL_COMPRESS_MODEL, OPENVIKING_RECALL_COMPRESS_THINKING
- *   OPENVIKING_RECALL_LIMIT, OPENVIKING_SCORE_THRESHOLD
+ *   OPENVIKING_RECALL_LIMIT, OPENVIKING_RECALL_EXPERIENCES, OPENVIKING_SCORE_THRESHOLD
  *   OPENVIKING_WORKSPACE_PEER, OPENVIKING_RECALL_PEER_SCOPE
  *   OPENVIKING_DEBUG=1, OPENVIKING_DEBUG_LOG
  */
@@ -148,6 +148,12 @@ export function loadConfig() {
     recallLimit: Math.max(1, Math.floor(num(
       process.env.OPENVIKING_RECALL_LIMIT,
       num(cx.recallLimit, 6),
+    ))),
+    // Experiences contain distilled procedural guidance, so they need an independent quota instead
+    // of competing with event history for the same slots. Set this to 0 to restore the legacy behavior.
+    recallExperiences: Math.max(0, Math.floor(num(
+      process.env.OPENVIKING_RECALL_EXPERIENCES,
+      num(cx.recallExperiences, 3),
     ))),
     scoreThreshold: Math.min(1, Math.max(0, num(
       process.env.OPENVIKING_SCORE_THRESHOLD,

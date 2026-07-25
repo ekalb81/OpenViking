@@ -295,15 +295,37 @@ test("auto-recall prefers the server recall endpoint when available", async () =
         writeJson(res, {
           status: "ok",
           result: {
-            entries: [{
-              uri: "viking://user/zeus/memories/events/launch.md",
-              score: 0.9,
-              type: "events",
-              mode: "summary",
-              summary: "Launch summary",
-            }],
-            rendered: '<memory_group type="events" count="1">\n<memory index="1" type="summary">\n  <uri>viking://user/zeus/memories/events/launch.md</uri>\n  <summary>Launch summary</summary>\n</memory>\n</memory_group>',
-            stats: { returned: 1 },
+            entries: [
+              {
+                uri: "viking://user/zeus/memories/events/launch.md",
+                score: 0.9,
+                type: "events",
+                mode: "summary",
+                summary: "Launch summary",
+              },
+              {
+                uri: "viking://user/zeus/memories/experiences/verify-before-closure.md",
+                score: 0.85,
+                type: "experiences",
+                mode: "summary",
+                summary: "NEVER declare closure before running the discriminating verification.",
+              },
+            ],
+            rendered: [
+              '<memory_group type="events" count="1">',
+              '<memory index="1" type="summary">',
+              '  <uri>viking://user/zeus/memories/events/launch.md</uri>',
+              '  <summary>Launch summary</summary>',
+              '</memory>',
+              '</memory_group>',
+              '<memory_group type="experiences" count="1">',
+              '<memory index="2" type="summary">',
+              '  <uri>viking://user/zeus/memories/experiences/verify-before-closure.md</uri>',
+              '  <summary>NEVER declare closure before running the discriminating verification.</summary>',
+              '</memory>',
+              '</memory_group>',
+            ].join("\n"),
+            stats: { returned: 2 },
           },
         });
         return;
@@ -337,10 +359,15 @@ test("auto-recall prefers the server recall endpoint when available", async () =
       const output = JSON.parse(result.stdout.trim());
       assert.match(output.hookSpecificOutput.additionalContext, /OpenViking memory digest/);
       assert.match(output.hookSpecificOutput.additionalContext, /Launch summary/);
+      assert.match(
+        output.hookSpecificOutput.additionalContext,
+        /NEVER declare closure before running the discriminating verification/,
+      );
     });
 
     assert.deepEqual(requests.map((request) => request.path), ["/api/v1/search/recall"]);
     assert.equal(requests[0].body.quotas.events, 2);
+    assert.equal(requests[0].body.quotas.experiences, 3);
     assert.equal(requests[0].body.max_chars, 6500);
   } finally {
     await rm(stateDir, { recursive: true, force: true });

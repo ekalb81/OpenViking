@@ -305,7 +305,7 @@ async function recallViaTypeQuotaEndpoint(query) {
       events: Math.max(cfg.recallLimit, 1),
       entities: Math.max(cfg.recallLimit, 1),
       preferences: Math.max(1, Math.min(cfg.recallLimit, 3)),
-      experiences: 0,
+      experiences: cfg.recallExperiences,
     },
     max_chars: cfg.recallCompress
       ? cfg.recallCompressMaxInputChars
@@ -559,6 +559,7 @@ async function main() {
     queryLength: userPrompt.length,
     config: {
       recallLimit: cfg.recallLimit,
+      recallExperiences: cfg.recallExperiences,
       scoreThreshold: cfg.scoreThreshold,
       peerSource: effectivePeer.source,
       recallPeerScope: cfg.recallPeerScope,

@@ -182,7 +182,10 @@ async def test_experiences_survive_a_budget_filled_by_earlier_types():
                 {
                     "uri": f"{target_uri}/{memory_type}-{index}.md",
                     "score": 0.9 - (index * 0.01),
-                    "abstract": f"{memory_type} abstract {index}",
+                    "abstract": (
+                        f"{memory_type} actionable abstract {index}: verify the real outcome first. "
+                        + ("A" * 2400)
+                    ),
                 }
                 for index in range(6)
             ]
@@ -192,7 +195,7 @@ async def test_experiences_survive_a_budget_filled_by_earlier_types():
         del kwargs
         # Unique per uri: the renderer dedupes by content hash, so identical bodies collapse to one
         # entry and the budget interaction under test never happens.
-        return f"{uri} " + ("C" * 300)
+        return f"{uri} " + ("C" * 3200)
 
     service = SimpleNamespace(
         search=SimpleNamespace(find=fake_find),
@@ -213,13 +216,17 @@ async def test_experiences_survive_a_budget_filled_by_earlier_types():
         max_chars=3000,
     )
 
-    # Presence is not the bar: a starved experience still appears as a bare URI stub carrying no
-    # content, which is unreadable and therefore useless. It has to render with its body.
-    experience_modes = [entry.mode for entry in result.entries if entry.type == "experiences"]
-    assert "full" in experience_modes, (
+    # Real experience bodies are multi-kilobyte and cannot fit in the 25% reserve at this budget.
+    # Presence is not the bar: a starved experience can appear as a bare URI stub carrying no lesson.
+    # Its compact abstract must survive as a usable summary when the full body does not fit.
+    experience_entries = [entry for entry in result.entries if entry.type == "experiences"]
+    assert any(entry.mode == "summary" for entry in experience_entries), (
         "experiences starved by earlier types; "
-        f"modes={experience_modes} all={[(e.type, e.mode) for e in result.entries]}"
+        f"modes={[entry.mode for entry in experience_entries]} "
+        f"all={[(e.type, e.mode) for e in result.entries]}"
     )
+    assert "experiences actionable abstract" in result.rendered
+    assert "verify the real outcome first" in result.rendered
 
 
 async def test_no_reserve_is_held_when_experiences_are_not_requested(monkeypatch):

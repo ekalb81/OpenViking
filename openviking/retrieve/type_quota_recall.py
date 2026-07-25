@@ -35,6 +35,7 @@ EVENTS_BUDGET_RATIO = 0.75
 # budget instead of only when max_chars is set unusually high. Applied only when experiences were
 # actually retrieved, so callers that do not ask for them lose nothing.
 EXPERIENCES_BUDGET_RESERVE_RATIO = 0.25
+MIN_ACTIONABLE_SUMMARY_CHARS = 80
 PREFERENCE_FULL_LIMIT = 3
 OTHER_PEER_OVERFETCH = 4
 ORIGIN_ORDER = ("actor_peer", "self", "other_peer")
@@ -267,6 +268,34 @@ def _summary_fragment(index: int, uri: str, score: float, summary: str) -> str:
     )
 
 
+def _fit_summary_fragment(
+    index: int,
+    uri: str,
+    score: float,
+    summary: str,
+    available_chars: int,
+) -> str | None:
+    """Fit a useful summary into the remaining fragment budget.
+
+    Semantic abstracts can themselves be several kilobytes. Falling straight back to a URI when one
+    does not fit recreates the original failure: the lesson was retrieved but none of its guidance
+    reached the agent. Preserve the leading actionable text when there is enough room to be useful.
+    """
+    if available_chars <= 0:
+        return None
+    full = _summary_fragment(index, uri, score, summary)
+    if len(full) <= available_chars:
+        return full
+    empty = _summary_fragment(index, uri, score, "")
+    text_budget = available_chars - len(empty)
+    if text_budget < MIN_ACTIONABLE_SUMMARY_CHARS:
+        return None
+    if len(summary) > text_budget:
+        summary = summary[: max(0, text_budget - 3)].rstrip() + "..."
+    fitted = _summary_fragment(index, uri, score, summary)
+    return fitted if len(fitted) <= available_chars else None
+
+
 def _uri_fragment(index: int, uri: str, score: float) -> str:
     return (
         f'<memory index="{index}" type="uri">\n'
@@ -462,6 +491,8 @@ async def search_type_quota_recall(
                     fragment = _summary_fragment(index, uri, score, summary)
             elif abstract:
                 summary = abstract
+                mode = "summary"
+                fragment = _summary_fragment(index, uri, score, summary)
 
         # VikingBot's heuristic only budgets full fragments, but max_chars is
         # this API's contract: every rendered fragment counts. Fallbacks keep
@@ -470,8 +501,19 @@ async def search_type_quota_recall(
             cap = global_cap(memory_type)
             fragment_chars = len(fragment) + (1 if total_chars else 0)
             if total_chars + fragment_chars > cap and mode == "summary":
-                mode = "uri"
-                fragment = _uri_fragment(index, uri, score)
+                separator_chars = 1 if total_chars else 0
+                fitted_summary = _fit_summary_fragment(
+                    index,
+                    uri,
+                    score,
+                    summary,
+                    cap - total_chars - separator_chars,
+                )
+                if fitted_summary is not None:
+                    fragment = fitted_summary
+                else:
+                    mode = "uri"
+                    fragment = _uri_fragment(index, uri, score)
                 fragment_chars = len(fragment) + (1 if total_chars else 0)
             if total_chars + fragment_chars > cap:
                 dropped += 1
