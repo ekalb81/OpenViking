@@ -29,6 +29,12 @@ DEFAULT_OTHER_PEER_PENALTIES = {
 DEFAULT_MAX_CHARS = 6500
 DEFAULT_MIN_SCORE = 0.1
 EVENTS_BUDGET_RATIO = 0.75
+# Experiences render last in TYPE_ORDER against a shared max_chars budget, so without a floor they are
+# starved by whatever came before — a single events .overview.md roll-up is routinely several thousand
+# characters on its own. Reserving a slice keeps distilled procedural memory reachable at the default
+# budget instead of only when max_chars is set unusually high. Applied only when experiences were
+# actually retrieved, so callers that do not ask for them lose nothing.
+EXPERIENCES_BUDGET_RESERVE_RATIO = 0.25
 PREFERENCE_FULL_LIMIT = 3
 OTHER_PEER_OVERFETCH = 4
 ORIGIN_ORDER = ("actor_peer", "self", "other_peer")
@@ -387,6 +393,17 @@ async def search_type_quota_recall(
     fragments_by_origin_type: dict[tuple[str, str], list[str]] = {}
     budgets = type_char_budgets(max_chars)
     used_by_type = dict.fromkeys(TYPE_ORDER, 0)
+    # Earlier types may not spend the slice held for experiences. Without this they consume max_chars
+    # first-come-first-served in TYPE_ORDER and experiences, being last, render nothing at all.
+    experiences_reserve = (
+        int(max_chars * EXPERIENCES_BUDGET_RESERVE_RATIO)
+        if any(entry[0] == "experiences" for entry in selected)
+        else 0
+    )
+
+    def global_cap(memory_type: str) -> int:
+        return max_chars if memory_type == "experiences" else max_chars - experiences_reserve
+
     total_chars = 0
     preference_full_count = 0
     dropped = 0
@@ -431,7 +448,7 @@ async def search_type_quota_recall(
                 can_try_full
                 and used_by_type.get(memory_type, 0) + full_chars
                 <= budgets.get(memory_type, max_chars)
-                and total_chars + full_chars <= max_chars
+                and total_chars + full_chars <= global_cap(memory_type)
             ):
                 mode = "full"
                 entry_content = content
@@ -450,12 +467,13 @@ async def search_type_quota_recall(
         # this API's contract: every rendered fragment counts. Fallbacks keep
         # degrading (summary -> uri) and drop entirely once nothing fits.
         if mode != "full":
+            cap = global_cap(memory_type)
             fragment_chars = len(fragment) + (1 if total_chars else 0)
-            if total_chars + fragment_chars > max_chars and mode == "summary":
+            if total_chars + fragment_chars > cap and mode == "summary":
                 mode = "uri"
                 fragment = _uri_fragment(index, uri, score)
                 fragment_chars = len(fragment) + (1 if total_chars else 0)
-            if total_chars + fragment_chars > max_chars:
+            if total_chars + fragment_chars > cap:
                 dropped += 1
                 continue
             total_chars += fragment_chars

@@ -300,7 +300,11 @@ async function recallViaTypeQuotaEndpoint(query, actorPeerId = "") {
       events: Math.max(cfg.recallLimit, 1),
       entities: Math.max(cfg.recallLimit, 1),
       preferences: Math.max(1, Math.min(cfg.recallLimit, 3)),
-      experiences: 0,
+      // Type quotas search each type independently, so experiences get their own slots rather than
+      // competing on score with events — which they lose, being procedural rather than topical.
+      // Set OPENVIKING_RECALL_EXPERIENCES=0 (or claude_code.recallExperiences) to restore the old
+      // behaviour of never surfacing them.
+      experiences: cfg.recallExperiences,
     },
     max_chars: Math.max(cfg.recallMaxContentChars * Math.max(cfg.recallLimit, 1), 1000),
     min_score: cfg.scoreThreshold,

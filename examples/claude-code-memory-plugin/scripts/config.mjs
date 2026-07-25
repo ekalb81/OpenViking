@@ -225,6 +225,15 @@ export function loadConfig() {
       process.env.OPENVIKING_RECALL_LIMIT,
       num(cc.recallLimit, 6),
     ))),
+    // Per-turn quota for distilled procedural memories (Situation/Approach/Reflect). Separate from
+    // recallLimit because experiences answer a different question than events do: events say what
+    // happened on a past task, experiences say how to do the current one. Left at 0 they never surface
+    // in auto-recall at all, and the store's accumulated "NEVER/ALWAYS" rules are only reachable by an
+    // explicit recall call that an agent has to think to make.
+    recallExperiences: Math.max(0, Math.floor(num(
+      process.env.OPENVIKING_RECALL_EXPERIENCES,
+      num(cc.recallExperiences, 3),
+    ))),
     scoreThreshold: Math.min(1, Math.max(0, num(
       process.env.OPENVIKING_SCORE_THRESHOLD,
       num(cc.scoreThreshold, 0.35),
