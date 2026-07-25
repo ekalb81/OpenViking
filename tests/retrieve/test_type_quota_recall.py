@@ -115,6 +115,155 @@ async def test_parallel_search_preserves_type_order():
     assert [entry.rank for entry in result.entries] == [1, 1]
 
 
+async def test_actor_stats_distinguish_prequota_retrieval_from_selection():
+    event_root = "viking://user/test_user/memories/events"
+
+    async def fake_find(**kwargs):
+        target_uri = kwargs["target_uri"]
+        if target_uri == event_root:
+            return _FakeFindResult(
+                [
+                    {
+                        "uri": f"{event_root}/event-{index}.md",
+                        "score": 0.9 - (index * 0.1),
+                    }
+                    for index in range(3)
+                ]
+            )
+        return _FakeFindResult()
+
+    async def fake_read(uri, **kwargs):
+        del kwargs
+        return f"content for {uri}"
+
+    service = SimpleNamespace(
+        search=SimpleNamespace(find=fake_find),
+        fs=SimpleNamespace(read=fake_read),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier.the_default_user("test_user"),
+        role=Role.USER,
+        actor_peer_id="current",
+    )
+
+    result = await search_type_quota_recall(
+        service=service,
+        ctx=ctx,
+        query="prequota telemetry",
+        peer_scope="actor",
+        quotas={"events": 1, "entities": 0, "preferences": 0, "experiences": 0},
+        max_chars=2_000,
+    )
+
+    # Preserve the legacy actor-scoped ``searched`` count while exposing the
+    # otherwise invisible candidates that existed before quota limiting.
+    assert result.stats["searched"]["events"] == 1
+    assert result.stats["retrieved_by_type"]["events"] == 3
+    assert result.stats["selected_by_type"]["events"] == 1
+    assert result.stats["returned_by_type"]["events"] == 1
+    assert result.stats["rendered_chars"] == len(result.rendered)
+
+
+async def test_stats_explain_modes_and_every_selected_exclusion():
+    roots = {
+        memory_type: f"viking://user/test_user/memories/{memory_type}"
+        for memory_type in ("events", "entities", "preferences", "experiences")
+    }
+    oversized_experience_uri = f"{roots['experiences']}/{'x' * 700}.md"
+
+    candidates = {
+        "events": [
+            {"uri": f"{roots['events']}/summary.md", "score": 0.95},
+            {"uri": f"{roots['events']}/profile.md", "score": 0.94},
+        ],
+        "entities": [
+            {"uri": f"{roots['entities']}/primary.md", "score": 0.9},
+            {"uri": f"{roots['entities']}/duplicate.md", "score": 0.8},
+        ],
+        "preferences": [
+            {"uri": f"{roots['preferences']}/uri-only.md", "score": 0.85},
+        ],
+        "experiences": [
+            {"uri": oversized_experience_uri, "score": 0.88},
+        ],
+    }
+
+    async def fake_find(**kwargs):
+        target_uri = kwargs["target_uri"]
+        if "/peers/" in target_uri:
+            return _FakeFindResult()
+        memory_type = target_uri.rsplit("/", 1)[-1]
+        return _FakeFindResult(candidates.get(memory_type, []))
+
+    async def fake_read(uri, **kwargs):
+        del kwargs
+        if uri.endswith("/summary.md"):
+            return "Summary: verify the discriminating outcome.\n2026-07-25 ChatLog: " + ("e" * 900)
+        if uri.endswith("/primary.md") or uri.endswith("/duplicate.md"):
+            return "shared entity fact"
+        if uri.endswith("/uri-only.md"):
+            return "p" * 2_000
+        if uri == oversized_experience_uri:
+            return "x" * 3_000
+        raise AssertionError(f"unexpected read: {uri}")
+
+    service = SimpleNamespace(
+        search=SimpleNamespace(find=fake_find),
+        fs=SimpleNamespace(read=fake_read),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier.the_default_user("test_user"),
+        role=Role.USER,
+        actor_peer_id="current",
+    )
+
+    result = await search_type_quota_recall(
+        service=service,
+        ctx=ctx,
+        query="explain the recall funnel",
+        peer_scope="actor",
+        quotas={"events": 2, "entities": 2, "preferences": 1, "experiences": 1},
+        max_chars=900,
+    )
+
+    assert result.stats["returned_by_type"] == {
+        "events": 1,
+        "entities": 1,
+        "preferences": 1,
+        "experiences": 0,
+    }
+    assert result.stats["returned_by_mode"] == {"full": 1, "summary": 1, "uri": 1}
+    assert result.stats["excluded_by_type_reason"] == {
+        "events": {
+            "missing_or_profile_uri": 1,
+            "duplicate_content": 0,
+            "budget": 0,
+        },
+        "entities": {
+            "missing_or_profile_uri": 0,
+            "duplicate_content": 1,
+            "budget": 0,
+        },
+        "preferences": {
+            "missing_or_profile_uri": 0,
+            "duplicate_content": 0,
+            "budget": 0,
+        },
+        "experiences": {
+            "missing_or_profile_uri": 0,
+            "duplicate_content": 0,
+            "budget": 1,
+        },
+    }
+    selected_count = sum(result.stats["selected_by_type"].values())
+    excluded_count = sum(
+        sum(reasons.values()) for reasons in result.stats["excluded_by_type_reason"].values()
+    )
+    assert selected_count == result.stats["returned"] + excluded_count
+    assert result.stats["dropped"] == 1
+    assert result.stats["rendered_chars"] == len(result.rendered)
+
+
 async def test_recall_hides_persisted_memory_fields_metadata():
     memory_uri = "viking://user/test_user/memories/events/example.md"
     raw_memory = """Visible memory body

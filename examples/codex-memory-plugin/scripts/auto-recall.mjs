@@ -35,8 +35,19 @@ const effectivePeer = resolveEffectivePeerId({ cfg, cwd: process.cwd() });
 
 let emitted = false;
 let activeCompressor = null;
+let compressionInFlight = false;
 let recallDeadline = null;
+let recallOutcomeLogged = false;
+let observedQueryLength = 0;
+let activeRecallPath = "none";
+const hookStartedAt = Date.now();
 const DEFAULT_FINAL_RECALL_CHARS = 6500;
+const TELEMETRY_SCHEMA_VERSION = 1;
+const MEMORY_TYPES = ["events", "entities", "preferences", "experiences"];
+const MEMORY_MODES = ["full", "summary", "uri"];
+const MEMORY_ORIGINS = ["actor_peer", "self", "other_peer"];
+const EXCLUSION_REASONS = ["missing_or_profile_uri", "duplicate_content", "budget"];
+const FALLBACK_CATEGORIES = [...MEMORY_TYPES, "cases", "trajectories", "skills"];
 
 function output(obj, exitAfter = false) {
   if (emitted) return;
@@ -80,6 +91,13 @@ function emit(additionalContext) {
 
 recallDeadline = setTimeout(() => {
   logError("recall_timeout", `timed out after ${cfg.recallTimeoutMs}ms`);
+  logRecallOutcome({
+    path: activeRecallPath,
+    outcome: "timeout",
+    compressionOutcome: cfg.recallCompress
+      ? (compressionInFlight ? "timeout" : "not_attempted")
+      : "disabled",
+  });
   try {
     activeCompressor?.kill("SIGKILL");
   } catch { /* best effort */ }
@@ -120,6 +138,146 @@ async function fetchJSON(path, init = {}) {
 function clampScore(v) {
   if (typeof v !== "number" || Number.isNaN(v)) return 0;
   return Math.max(0, Math.min(1, v));
+}
+
+function countKnownValues(items, allowed, valueFor) {
+  const counts = {};
+  for (const item of items || []) {
+    const raw = String(valueFor(item) || "").toLowerCase();
+    const key = allowed.includes(raw) ? raw : "other";
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function numericMap(value, allowedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result = {};
+  for (const key of allowedKeys) {
+    const number = Number(value[key]);
+    if (Number.isFinite(number)) result[key] = number;
+  }
+  return result;
+}
+
+function sanitizeServerStats(value) {
+  const stats = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const safe = {};
+  for (const key of ["returned", "dropped", "rendered_chars", "max_chars", "min_score"]) {
+    const number = Number(stats[key]);
+    if (Number.isFinite(number)) safe[key] = number;
+  }
+  if (stats.peer_scope === "actor" || stats.peer_scope === "all") {
+    safe.peer_scope = stats.peer_scope;
+  }
+  if (Array.isArray(stats.roots)) safe.root_count = stats.roots.length;
+
+  const quotas = numericMap(stats.quotas, MEMORY_TYPES);
+  const searched = numericMap(stats.searched, MEMORY_TYPES);
+  const retrievedByType = numericMap(stats.retrieved_by_type, MEMORY_TYPES);
+  const selectedByType = numericMap(stats.selected_by_type, MEMORY_TYPES);
+  const returnedByType = numericMap(stats.returned_by_type, MEMORY_TYPES);
+  const returnedByMode = numericMap(stats.returned_by_mode, MEMORY_MODES);
+  const origins = numericMap(stats.origins, MEMORY_ORIGINS);
+  const penalties = numericMap(stats.other_peer_penalties, MEMORY_TYPES);
+  const excludedByTypeReason = {};
+  for (const type of MEMORY_TYPES) {
+    const reasons = numericMap(stats.excluded_by_type_reason?.[type], EXCLUSION_REASONS);
+    if (Object.keys(reasons).length > 0) excludedByTypeReason[type] = reasons;
+  }
+  if (Object.keys(quotas).length > 0) safe.quotas = quotas;
+  if (Object.keys(searched).length > 0) safe.searched = searched;
+  if (Object.keys(retrievedByType).length > 0) safe.retrieved_by_type = retrievedByType;
+  if (Object.keys(selectedByType).length > 0) safe.selected_by_type = selectedByType;
+  if (Object.keys(returnedByType).length > 0) safe.returned_by_type = returnedByType;
+  if (Object.keys(returnedByMode).length > 0) safe.returned_by_mode = returnedByMode;
+  if (Object.keys(excludedByTypeReason).length > 0) safe.excluded_by_type_reason = excludedByTypeReason;
+  if (Object.keys(origins).length > 0) safe.origins = origins;
+  if (Object.keys(penalties).length > 0) safe.other_peer_penalties = penalties;
+  return safe;
+}
+
+function summarizeRanks(entries) {
+  const ranks = (entries || [])
+    .map((entry) => Number(entry?.rank))
+    .filter((rank) => Number.isFinite(rank) && rank > 0);
+  return {
+    known_count: ranks.length,
+    min: ranks.length > 0 ? Math.min(...ranks) : null,
+    max: ranks.length > 0 ? Math.max(...ranks) : null,
+  };
+}
+
+function endpointServerTelemetry(entries, stats, rendered) {
+  return {
+    stats: sanitizeServerStats(stats),
+    returned_by_type: countKnownValues(entries, MEMORY_TYPES, (entry) => entry?.type),
+    returned_by_mode: countKnownValues(entries, MEMORY_MODES, (entry) => entry?.mode),
+    rank: summarizeRanks(entries),
+    rendered_chars: String(rendered || "").length,
+  };
+}
+
+function fallbackServerTelemetry(raw, eligible, picked, transport = null) {
+  const telemetry = {
+    stats: {
+      retrieved: Array.isArray(raw) ? raw.length : 0,
+      eligible: Array.isArray(eligible) ? eligible.length : 0,
+      selected: Array.isArray(picked) ? picked.length : 0,
+    },
+    selected_by_type: countKnownValues(picked, FALLBACK_CATEGORIES, (entry) => entry?.category),
+    returned_by_type: {},
+    returned_by_mode: {},
+    rank: { known_count: 0, min: null, max: null },
+    rendered_chars: 0,
+  };
+  if (transport) {
+    telemetry.transport = {
+      endpoint: "failed",
+      fallback: {
+        attempted_count: Math.max(0, Math.floor(Number(transport.attempted_count) || 0)),
+        succeeded_count: Math.max(0, Math.floor(Number(transport.succeeded_count) || 0)),
+        failed_count: Math.max(0, Math.floor(Number(transport.failed_count) || 0)),
+      },
+    };
+  }
+  return telemetry;
+}
+
+function countUriReferences(value) {
+  return (String(value || "").match(/\bviking:\/\/[^\s<>"']+/gi) || []).length;
+}
+
+function logRecallOutcome({
+  path = activeRecallPath,
+  outcome,
+  server = {},
+  outputBasis = "none",
+  outputText = "",
+  compressionOutcome = cfg.recallCompress ? "not_attempted" : "disabled",
+  topScore = 0,
+} = {}) {
+  if (recallOutcomeLogged) return;
+  recallOutcomeLogged = true;
+  const emittedContext = outputText ? wrapRecallContext(outputText) : "";
+  log("recall_outcome", {
+    schema_version: TELEMETRY_SCHEMA_VERSION,
+    path,
+    outcome: outcome || "error",
+    query_length: observedQueryLength,
+    server,
+    output: {
+      basis: outputBasis,
+      chars: emittedContext.length,
+      uri_reference_count: countUriReferences(emittedContext),
+    },
+    compression: {
+      enabled: cfg.recallCompress,
+      outcome: compressionOutcome,
+    },
+    top_score: clampScore(Number(topScore)),
+    latency_ms: Math.max(0, Date.now() - hookStartedAt),
+  });
 }
 
 const PREFERENCE_QUERY_RE = /prefer|preference|favorite|favourite|like|偏好|喜欢|爱好|更倾向/i;
@@ -226,7 +384,11 @@ async function searchScope(query, targetUri, limit, bucket = "memories", session
     method: "POST",
     body: JSON.stringify(body),
   });
-  return result.ok ? (result.result?.[bucket] || []) : [];
+  if (!result.ok) return { ok: false, items: [] };
+  return {
+    ok: true,
+    items: Array.isArray(result.result?.[bucket]) ? result.result[bucket] : [],
+  };
 }
 
 // Candidate target URIs for a bucket, most-specific first. In trusted mode a
@@ -253,32 +415,52 @@ function userScopedTargets(kind) {
 // request and the worst case is bounded by (targets x 2) — instead of running
 // a per-target session+fallback for every target.
 async function searchBucket(query, targetUris, limit, bucket, sessionId = null) {
+  const transport = { attempted_count: 0, succeeded_count: 0, failed_count: 0 };
+  const search = async (targetUri, activeSessionId) => {
+    let result;
+    try {
+      result = await searchScope(query, targetUri, limit, bucket, activeSessionId);
+    } catch {
+      result = { ok: false, items: [] };
+    }
+    transport.attempted_count += 1;
+    transport[result.ok ? "succeeded_count" : "failed_count"] += 1;
+    return result.items;
+  };
   for (const targetUri of targetUris) {
-    const items = await searchScope(query, targetUri, limit, bucket, sessionId);
-    if (items.length > 0) return items;
+    const items = await search(targetUri, sessionId);
+    if (items.length > 0) return { items, transport };
   }
-  if (!sessionId) return [];
+  if (!sessionId) return { items: [], transport };
   for (const targetUri of targetUris) {
-    const items = await searchScope(query, targetUri, limit, bucket, null);
-    if (items.length > 0) return items;
+    const items = await search(targetUri, null);
+    if (items.length > 0) return { items, transport };
   }
-  return [];
+  return { items: [], transport };
 }
 
 async function searchAll(query, limit, sessionId = null) {
-  const [userMems, userSkills] = await Promise.all([
+  const [memoryResult, skillResult] = await Promise.all([
     searchBucket(query, userScopedTargets("memories"), limit, "memories", sessionId),
     searchBucket(query, userScopedTargets("skills"), limit, "skills", sessionId),
   ]);
+  const userMems = memoryResult.items;
+  const userSkills = skillResult.items;
+  const transport = {
+    attempted_count: memoryResult.transport.attempted_count + skillResult.transport.attempted_count,
+    succeeded_count: memoryResult.transport.succeeded_count + skillResult.transport.succeeded_count,
+    failed_count: memoryResult.transport.failed_count + skillResult.transport.failed_count,
+  };
   log("search_complete", { scope: "user", rawCount: userMems.length, topScores: userMems.slice(0, 3).map((m) => m.score) });
   log("search_complete", { scope: "skills", rawCount: userSkills.length, topScores: userSkills.slice(0, 3).map((m) => m.score) });
   const all = [...userMems, ...userSkills];
   const seen = new Set();
-  return all.filter((m) => {
+  const items = all.filter((m) => {
     if (seen.has(m.uri)) return false;
     seen.add(m.uri);
     return true;
   });
+  return { items, transport };
 }
 
 function resolveRecallSessionId(codexSessionId) {
@@ -314,7 +496,12 @@ async function recallViaTypeQuotaEndpoint(query) {
     render: true,
   };
   if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
-  const result = await postRecall(fetchJSON, body, { actorPeerId: effectivePeer.peerId, log });
+  let result;
+  try {
+    result = await postRecall(fetchJSON, body, { actorPeerId: effectivePeer.peerId, log });
+  } catch {
+    result = { ok: false, status: 0 };
+  }
   if (!result.ok) {
     log("recall_endpoint_fallback", { status: result.status || 0 });
     return null;
@@ -339,7 +526,12 @@ async function recallViaTypeQuotaEndpoint(query) {
         "More detail: use the OpenViking MCP recall/read/search tools with cited viking:// URIs if needed.",
       ].join("\n")
     : "";
-  return { context, items };
+  return {
+    context,
+    items,
+    server: endpointServerTelemetry(entries, result.result?.stats, rendered),
+    topScore: entries.reduce((best, entry) => Math.max(best, clampScore(entry?.score)), 0),
+  };
 }
 
 function truncateText(text, maxChars) {
@@ -468,9 +660,10 @@ async function runCodexCompressor(prompt, profile) {
           return;
         }
         if (code !== 0) {
-          logError("compress_exit", {
+          log("compress_exit", {
+            exit_code: code,
+            stderr_chars: stderr.length,
             profile,
-            error: stderr.trim().slice(-1000) || `codex exited ${code}`,
           });
           finish(null, { runtimeFailed: true });
           return;
@@ -490,11 +683,14 @@ async function runCodexCompressor(prompt, profile) {
 }
 
 async function compressMemoryContext(userPrompt, items) {
-  if (!cfg.recallCompress) return null;
+  if (!cfg.recallCompress) return { context: null, outcome: "disabled" };
   const profile = await getRecallCompressorProfile();
   if (!profile.enabled) {
     log("compress_skip", { reason: "profile disabled", profile });
-    return null;
+    return {
+      context: null,
+      outcome: profile.source === "runtime_failed" ? "runtime_failed" : "profile_disabled",
+    };
   }
   const perItemChars = Math.max(500, Math.floor(cfg.recallCompressMaxInputChars / Math.max(1, items.length)));
   const payload = {
@@ -524,16 +720,26 @@ Task:
 Input JSON:
 ${JSON.stringify(payload, null, 2)}
 `;
-  const raw = await runCodexCompressor(prompt, profile);
-  if (raw === null) return null;
+  compressionInFlight = true;
+  let raw;
+  try {
+    raw = await runCodexCompressor(prompt, profile);
+  } finally {
+    compressionInFlight = false;
+  }
+  if (raw === null) return { context: null, outcome: "runtime_failed" };
   const compressed = normalizeCompressedContext(raw);
-  log("compressed", { inputCount: items.length, chars: compressed.length, profile });
-  return compressed;
+  log("compressed", { input_count: items.length, chars: compressed.length, profile });
+  return {
+    context: compressed,
+    outcome: compressed ? "compressed" : "filtered_all",
+  };
 }
 
 async function main() {
   if (!cfg.autoRecall) {
     log("skip", { stage: "init", reason: "autoRecall disabled" });
+    logRecallOutcome({ path: "none", outcome: "disabled", compressionOutcome: "not_attempted" });
     emit();
     return;
   }
@@ -545,18 +751,19 @@ async function main() {
     input = JSON.parse(Buffer.concat(chunks).toString());
   } catch {
     log("skip", { stage: "stdin_parse", reason: "invalid input" });
+    logRecallOutcome({ path: "none", outcome: "bad_stdin", compressionOutcome: "not_attempted" });
     emit();
     return;
   }
 
   const userPrompt = (input.prompt || "").trim();
+  observedQueryLength = userPrompt.length;
   const codexSessionId = typeof input.session_id === "string" ? input.session_id.trim() : "";
   const recallSessionId = resolveRecallSessionId(codexSessionId);
   log("start", {
     codexSessionId: codexSessionId || null,
     recallSessionId,
-    query: userPrompt.slice(0, 200),
-    queryLength: userPrompt.length,
+    query_length: observedQueryLength,
     config: {
       recallLimit: cfg.recallLimit,
       recallExperiences: cfg.recallExperiences,
@@ -568,6 +775,7 @@ async function main() {
 
   if (!userPrompt || userPrompt.length < cfg.minQueryLength) {
     log("skip", { stage: "query_check", reason: "query too short or empty" });
+    logRecallOutcome({ path: "none", outcome: "short_query", compressionOutcome: "not_attempted" });
     emit();
     return;
   }
@@ -575,44 +783,79 @@ async function main() {
   const health = await fetchJSON("/health");
   if (!health.ok) {
     logError("health_check", "server unreachable or unhealthy");
+    logRecallOutcome({ path: "none", outcome: "offline", compressionOutcome: "not_attempted" });
     emit();
     return;
   }
 
+  activeRecallPath = "type_quota_endpoint";
   const endpointRecall = await recallViaTypeQuotaEndpoint(userPrompt);
   if (endpointRecall !== null) {
     if (!endpointRecall.context && endpointRecall.items.length === 0) {
       log("skip", { stage: "recall_endpoint", reason: "no results" });
+      logRecallOutcome({
+        outcome: "no_results",
+        server: endpointRecall.server,
+        compressionOutcome: cfg.recallCompress ? "not_attempted" : "disabled",
+        topScore: endpointRecall.topScore,
+      });
       emit();
       return;
     }
-    const compressedContext = endpointRecall.items.length > 0
+    const compression = endpointRecall.items.length > 0
       ? await compressMemoryContext(userPrompt, endpointRecall.items)
-      : null;
+      : { context: null, outcome: cfg.recallCompress ? "not_attempted" : "disabled" };
     const endpointFallback = cfg.recallCompress && endpointRecall.items.length > 0
       ? fallbackDigest(endpointRecall.items)
       : endpointRecall.context;
-    const memoryContext = compressedContext === null
+    const memoryContext = compression.context === null
       ? endpointFallback
-      : compressedContext;
+      : compression.context;
+    const outputBasis = compression.context !== null
+      ? "compressed_digest"
+      : (cfg.recallCompress && endpointRecall.items.length > 0 ? "fallback_digest" : "server_render");
     if (!memoryContext) {
       log("skip", { stage: "recall_endpoint", reason: "compressor found no relevant memory" });
+      logRecallOutcome({
+        outcome: compression.outcome === "filtered_all" ? "filtered_all" : "no_results",
+        server: endpointRecall.server,
+        outputBasis,
+        compressionOutcome: compression.outcome,
+        topScore: endpointRecall.topScore,
+      });
       emit();
       return;
     }
     log("recall_endpoint", {
       chars: memoryContext.length,
-      compressed: compressedContext !== null,
-      entryCount: endpointRecall.items.length,
+      compressed: compression.context !== null,
+    });
+    logRecallOutcome({
+      outcome: "emitted",
+      server: endpointRecall.server,
+      outputBasis,
+      outputText: memoryContext,
+      compressionOutcome: compression.outcome,
+      topScore: endpointRecall.topScore,
     });
     emit(memoryContext);
     return;
   }
 
+  activeRecallPath = "fallback_search";
   const candidateLimit = Math.max(cfg.recallLimit * 4, 20);
-  const allMemories = await searchAll(userPrompt, candidateLimit, recallSessionId);
+  const fallbackRecall = await searchAll(userPrompt, candidateLimit, recallSessionId);
+  const allMemories = fallbackRecall.items;
   if (allMemories.length === 0) {
-    log("skip", { stage: "search", reason: "no results" });
+    const outcome = fallbackRecall.transport.succeeded_count === 0
+      ? "fallback_failed"
+      : "degraded_no_results";
+    log("skip", { stage: "search", reason: outcome, transport: fallbackRecall.transport });
+    logRecallOutcome({
+      outcome,
+      server: fallbackServerTelemetry([], [], [], fallbackRecall.transport),
+      compressionOutcome: cfg.recallCompress ? "not_attempted" : "disabled",
+    });
     emit();
     return;
   }
@@ -626,24 +869,38 @@ async function main() {
     .sort((a, b) => b.breakdown.finalScore - a.breakdown.finalScore);
 
   if (cfg.logRankingDetails) {
-    for (const entry of ranked) {
-      log("ranking_detail", { uri: entry.item.uri, ...entry.breakdown });
+    for (const [index, entry] of ranked.entries()) {
+      const category = String(entry.item.category || "").toLowerCase();
+      log("ranking_detail", {
+        rank: index + 1,
+        category: MEMORY_TYPES.includes(category) ? category : "other",
+        ...entry.breakdown,
+      });
     }
   } else {
     log("ranking_summary", {
       candidateCount: processed.length,
-      topCandidates: ranked.slice(0, 5).map((entry) => ({ uri: entry.item.uri, finalScore: entry.breakdown.finalScore })),
+      topScores: ranked.slice(0, 5).map((entry) => entry.breakdown.finalScore),
     });
   }
 
   const memories = pickMemories(processed, cfg.recallLimit, userPrompt);
   if (memories.length === 0) {
     log("skip", { stage: "pick", reason: "no memories survived ranking" });
+    logRecallOutcome({
+      outcome: "filtered_all",
+      server: fallbackServerTelemetry(allMemories, processed, [], fallbackRecall.transport),
+      compressionOutcome: cfg.recallCompress ? "not_attempted" : "disabled",
+      topScore: ranked[0]?.item?.score || 0,
+    });
     emit();
     return;
   }
 
-  log("picked", { pickedCount: memories.length, uris: memories.map((m) => m.uri) });
+  log("picked", {
+    pickedCount: memories.length,
+    topScore: memories.reduce((best, item) => Math.max(best, clampScore(item.score)), 0),
+  });
 
   const memoryItems = await Promise.all(
     memories.map(async (item) => {
@@ -661,10 +918,26 @@ async function main() {
     }),
   );
 
-  const compressedContext = await compressMemoryContext(userPrompt, memoryItems);
-  const memoryContext = compressedContext === null ? fallbackDigest(memoryItems) : compressedContext;
+  const compression = await compressMemoryContext(userPrompt, memoryItems);
+  const memoryContext = compression.context === null ? fallbackDigest(memoryItems) : compression.context;
+  const outputBasis = compression.context === null ? "fallback_digest" : "compressed_digest";
+  logRecallOutcome({
+    outcome: memoryContext ? "emitted" : "filtered_all",
+    server: fallbackServerTelemetry(allMemories, processed, memories, fallbackRecall.transport),
+    outputBasis,
+    outputText: memoryContext,
+    compressionOutcome: compression.outcome,
+    topScore: memories.reduce((best, item) => Math.max(best, clampScore(item.score)), 0),
+  });
 
   emit(memoryContext);
 }
 
-main().catch((err) => { logError("uncaught", err); emit(); });
+main().catch((err) => {
+  logError("uncaught", err);
+  logRecallOutcome({
+    outcome: "error",
+    compressionOutcome: cfg.recallCompress ? "not_attempted" : "disabled",
+  });
+  emit();
+});

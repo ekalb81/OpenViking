@@ -174,25 +174,38 @@ const SOURCES = [
 ];
 
 async function searchOneSource(query, source, limit, actorPeerId = "") {
-  const resolvedUri = await resolveTargetUri(source.uri, actorPeerId);
-  const body = { query, target_uri: resolvedUri, limit, score_threshold: 0 };
-  const res = await fetchJSON("/api/v1/search/find", {
-    method: "POST",
-    body: JSON.stringify(body),
-  }, { actorPeerId });
-  if (!res.ok) return [];
-  const items = res.result?.[source.bucket] || [];
-  return items.map(item => ({ ...item, _sourceType: source.type }));
+  try {
+    const resolvedUri = await resolveTargetUri(source.uri, actorPeerId);
+    const body = { query, target_uri: resolvedUri, limit, score_threshold: 0 };
+    const res = await fetchJSON("/api/v1/search/find", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { actorPeerId });
+    if (!res.ok) return { ok: false, items: [] };
+    const items = Array.isArray(res.result?.[source.bucket]) ? res.result[source.bucket] : [];
+    return {
+      ok: true,
+      items: items.map(item => ({ ...item, _sourceType: source.type })),
+    };
+  } catch {
+    return { ok: false, items: [] };
+  }
 }
 
 async function searchAllSources(query, perSourceLimit, actorPeerId = "") {
   const results = await Promise.all(SOURCES.map(src => searchOneSource(query, src, perSourceLimit, actorPeerId)));
-  const all = results.flat();
+  const all = results.flatMap(result => result.items);
+  const transport = {
+    attempted_count: results.length,
+    succeeded_count: results.filter(result => result.ok).length,
+    failed_count: results.filter(result => !result.ok).length,
+  };
   log("search_summary", {
-    counts: SOURCES.map((src, i) => ({ type: src.type, uri: src.uri, count: results[i].length })),
+    counts_by_type: Object.fromEntries(SOURCES.map((src, i) => [src.type, results[i].items.length])),
     total: all.length,
+    transport,
   });
-  return all;
+  return { items: all, transport };
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +219,92 @@ async function searchAllSources(query, perSourceLimit, actorPeerId = "") {
 /** chars/4 heuristic (openclaw-plugin/index.ts:1812) */
 function estimateTokens(text) {
   return text ? Math.ceil(text.length / 4) : 0;
+}
+
+const ENDPOINT_MODES = ["full", "summary", "uri"];
+const ENDPOINT_MEMORY_TYPES = ["events", "entities", "preferences", "experiences"];
+const ENDPOINT_EXCLUSION_REASONS = ["missing_or_profile_uri", "duplicate_content", "budget"];
+const FALLBACK_SOURCE_TYPES = ["memory", "skill"];
+
+function countKnownValues(items, valueForItem, knownValues) {
+  const counts = Object.fromEntries([...knownValues, "other"].map((value) => [value, 0]));
+  const allowed = new Set(knownValues);
+  for (const item of items) {
+    const raw = String(valueForItem(item) || "").trim().toLowerCase();
+    counts[allowed.has(raw) ? raw : "other"] += 1;
+  }
+  return counts;
+}
+
+function nonNegativeInteger(value, fallback = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.floor(numeric));
+}
+
+function sanitizeKnownCountMap(value, knownKeys) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(knownKeys.map((key) => [
+    key,
+    nonNegativeInteger(Object.hasOwn(source, key) ? source[key] : 0),
+  ]));
+}
+
+function sanitizeExcludedByTypeReason(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(ENDPOINT_MEMORY_TYPES.map((memoryType) => {
+    const reasons = Object.hasOwn(source, memoryType) ? source[memoryType] : {};
+    return [memoryType, sanitizeKnownCountMap(reasons, ENDPOINT_EXCLUSION_REASONS)];
+  }));
+}
+
+function aggregateServerStats(stats, fallbackReturned = 0) {
+  const source = stats && typeof stats === "object" && !Array.isArray(stats) ? stats : {};
+  const searchedByType = sanitizeKnownCountMap(source.searched, ENDPOINT_MEMORY_TYPES);
+  return {
+    searched_count: Object.values(searchedByType).reduce((total, count) => total + count, 0),
+    returned_count: nonNegativeInteger(source.returned, fallbackReturned),
+    dropped_count: nonNegativeInteger(source.dropped),
+    max_chars: nonNegativeInteger(source.max_chars),
+    retrieved_by_type: sanitizeKnownCountMap(source.retrieved_by_type, ENDPOINT_MEMORY_TYPES),
+    selected_by_type: sanitizeKnownCountMap(source.selected_by_type, ENDPOINT_MEMORY_TYPES),
+    returned_by_type: sanitizeKnownCountMap(source.returned_by_type, ENDPOINT_MEMORY_TYPES),
+    returned_by_mode: sanitizeKnownCountMap(source.returned_by_mode, ENDPOINT_MODES),
+    excluded_by_type_reason: sanitizeExcludedByTypeReason(source.excluded_by_type_reason),
+    rendered_chars: nonNegativeInteger(source.rendered_chars),
+  };
+}
+
+function summarizeEndpointEmission(endpointRecall) {
+  const block = String(endpointRecall?.block || "");
+  const entries = block && Array.isArray(endpointRecall?.entries)
+    ? endpointRecall.entries.filter((entry) => entry && typeof entry === "object")
+    : [];
+  const modeCounts = countKnownValues(entries, (entry) => entry.mode, ENDPOINT_MODES);
+  const typeCounts = countKnownValues(entries, (entry) => entry.type, ENDPOINT_MEMORY_TYPES);
+  const contentItems = modeCounts.full + modeCounts.summary;
+  const hintItems = modeCounts.uri + modeCounts.other;
+  const estimatedTokens = estimateTokens(block);
+  const topScore = entries.reduce((highest, entry) => Math.max(highest, clampScore(entry.score)), 0);
+
+  return {
+    count: entries.length,
+    content_items: contentItems,
+    hint_items: hintItems,
+    mode_counts: modeCounts,
+    type_counts: typeCounts,
+    tokens_used: estimatedTokens,
+    top_score: topScore,
+    server_stats: aggregateServerStats(endpointRecall?.stats, entries.length),
+    output_stats: {
+      emitted: Boolean(block),
+      item_count: entries.length,
+      content_item_count: contentItems,
+      hint_item_count: hintItems,
+      chars: block.length,
+      estimated_tokens: estimatedTokens,
+    },
+  };
 }
 
 /**
@@ -281,16 +380,20 @@ async function buildInjectionBlock(items, actorPeerId = "") {
   }
 
   lines.push("</openviking-context>");
+  const block = lines.join("\n");
 
   const budgetUsed = cfg.recallTokenBudget - budgetRemaining;
-  log("injection_built", {
-    contentItems: contentCount,
-    hintItems: hintCount,
-    budgetUsed,
-    budgetTotal: cfg.recallTokenBudget,
+  log("output_built", {
+    emitted_item_count: contentCount + hintCount,
+    emitted_content_item_count: contentCount,
+    emitted_hint_item_count: hintCount,
+    content_token_budget_used: budgetUsed,
+    content_token_budget_total: cfg.recallTokenBudget,
+    output_chars: block.length,
+    output_estimated_tokens: estimateTokens(block),
   });
 
-  return { block: lines.join("\n"), contentCount, hintCount, budgetUsed };
+  return { block, contentCount, hintCount, budgetUsed };
 }
 
 async function recallViaTypeQuotaEndpoint(query, actorPeerId = "") {
@@ -311,19 +414,30 @@ async function recallViaTypeQuotaEndpoint(query, actorPeerId = "") {
     render: true,
   };
   if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
-  const res = await postRecall(fetchJSON, body, { actorPeerId, log });
+  let res;
+  try {
+    res = await postRecall(fetchJSON, body, { actorPeerId, log });
+  } catch {
+    res = { ok: false, status: 0 };
+  }
   if (!res.ok) {
     log("recall_endpoint_fallback", { status: res.status || 0 });
     return null;
   }
   const rendered = String(res.result?.rendered || "").trim();
-  if (!rendered) return "";
-  return [
-    "<openviking-context>",
-    "Relevant memory from OpenViking. Use the recall/read MCP tools to expand URIs.",
-    rendered,
-    "</openviking-context>",
-  ].join("\n");
+  const entries = Array.isArray(res.result?.entries) ? res.result.entries : [];
+  const stats = res.result?.stats && typeof res.result.stats === "object" && !Array.isArray(res.result.stats)
+    ? res.result.stats
+    : {};
+  const block = rendered
+    ? [
+        "<openviking-context>",
+        "Relevant memory from OpenViking. Use the recall/read MCP tools to expand URIs.",
+        rendered,
+        "</openviking-context>",
+      ].join("\n")
+    : "";
+  return { block, entries, stats };
 }
 
 // ---------------------------------------------------------------------------
@@ -365,10 +479,10 @@ async function main() {
   const cwd = input.cwd;
   const effectivePeer = getEffectivePeerId(cfg, { sessionId, cwd });
   log("start", {
-    query: userPrompt.slice(0, 200),
-    queryLength: userPrompt.length,
+    query_length: userPrompt.length,
     config: {
       recallLimit: cfg.recallLimit,
+      recallExperiences: cfg.recallExperiences,
       scoreThreshold: cfg.scoreThreshold,
       recallMaxContentChars: cfg.recallMaxContentChars,
       recallTokenBudget: cfg.recallTokenBudget,
@@ -399,33 +513,56 @@ async function main() {
     return;
   }
 
-  const endpointBlock = await recallViaTypeQuotaEndpoint(userPrompt, effectivePeer.peerId);
-  if (endpointBlock !== null) {
-    if (!endpointBlock) {
-      log("skip", { reason: "recall_endpoint_no_results" });
-      writeRecallState({ count: 0, reason: "no_results", cc_session_id: sessionId });
+  const endpointRecall = await recallViaTypeQuotaEndpoint(userPrompt, effectivePeer.peerId);
+  if (endpointRecall !== null) {
+    const endpointTelemetry = summarizeEndpointEmission(endpointRecall);
+    if (!endpointRecall.block) {
+      log("skip", {
+        reason: "recall_endpoint_no_results",
+        server_stats: endpointTelemetry.server_stats,
+        output_stats: endpointTelemetry.output_stats,
+      });
+      writeRecallState({
+        ...endpointTelemetry,
+        tokens_budget: cfg.recallTokenBudget,
+        reason: "no_results",
+        cc_session_id: sessionId,
+      });
       approve();
       return;
     }
+    log("recall_endpoint_output", {
+      mode_counts: endpointTelemetry.mode_counts,
+      type_counts: endpointTelemetry.type_counts,
+      top_score: endpointTelemetry.top_score,
+      server_stats: endpointTelemetry.server_stats,
+      output_stats: endpointTelemetry.output_stats,
+    });
     writeRecallState({
-      count: 1,
-      content_items: 1,
-      hint_items: 0,
-      tokens_used: estimateTokens(endpointBlock),
+      ...endpointTelemetry,
       tokens_budget: cfg.recallTokenBudget,
-      top_score: 0,
       cc_session_id: sessionId,
       reason: "ok",
     });
-    approve(endpointBlock);
+    approve(endpointRecall.block);
     return;
   }
 
   const perSourceLimit = Math.max(cfg.recallLimit * 2, 8);
-  const raw = await searchAllSources(userPrompt, perSourceLimit, effectivePeer.peerId);
+  const fallbackRecall = await searchAllSources(userPrompt, perSourceLimit, effectivePeer.peerId);
+  const raw = fallbackRecall.items;
   if (raw.length === 0) {
-    log("skip", { reason: "no results" });
-    writeRecallState({ count: 0, reason: "no_results", cc_session_id: sessionId });
+    const reason = fallbackRecall.transport.succeeded_count === 0
+      ? "fallback_failed"
+      : "degraded_no_results";
+    log("skip", { reason, fallback_transport: fallbackRecall.transport });
+    writeRecallState({
+      count: 0,
+      reason,
+      endpoint_transport: "failed",
+      fallback_transport: fallbackRecall.transport,
+      cc_session_id: sessionId,
+    });
     approve();
     return;
   }
@@ -435,33 +572,58 @@ async function main() {
   filtered.sort((a, b) => rankItem(b, profile) - rankItem(a, profile));
   const deduped = dedupeItems(filtered);
   const picked = deduped.slice(0, cfg.recallLimit);
+  const pickedTypeCounts = countKnownValues(picked, (item) => item._sourceType, FALLBACK_SOURCE_TYPES);
+  const pickedTopScore = picked.reduce((highest, item) => Math.max(highest, clampScore(item.score)), 0);
   log("picked", {
-    rawCount: raw.length,
-    filteredCount: filtered.length,
-    dedupedCount: deduped.length,
-    pickedCount: picked.length,
-    items: picked.map(it => ({ type: it._sourceType, uri: it.uri, score: clampScore(it.score) })),
+    raw_count: raw.length,
+    filtered_count: filtered.length,
+    deduped_count: deduped.length,
+    picked_count: picked.length,
+    type_counts: pickedTypeCounts,
+    top_score: pickedTopScore,
   });
 
   if (picked.length === 0) {
-    writeRecallState({ count: 0, reason: "filtered_out", cc_session_id: sessionId });
+    writeRecallState({
+      count: 0,
+      reason: "filtered_out",
+      endpoint_transport: "failed",
+      fallback_transport: fallbackRecall.transport,
+      cc_session_id: sessionId,
+    });
     approve();
     return;
   }
 
   const built = await buildInjectionBlock(picked, effectivePeer.peerId);
-  const topScore = picked.reduce((m, it) => Math.max(m, clampScore(it.score)), 0);
+  const emittedBlock = String(built?.block || "");
+  const emittedContentCount = built?.contentCount ?? 0;
+  const emittedHintCount = built?.hintCount ?? 0;
+  const emittedCount = emittedContentCount + emittedHintCount;
+  const emittedTokens = estimateTokens(emittedBlock);
   writeRecallState({
-    count: picked.length,
-    content_items: built?.contentCount ?? 0,
-    hint_items: built?.hintCount ?? 0,
-    tokens_used: built?.budgetUsed ?? 0,
+    count: emittedCount,
+    content_items: emittedContentCount,
+    hint_items: emittedHintCount,
+    mode_counts: { content: emittedContentCount, uri: emittedHintCount },
+    type_counts: pickedTypeCounts,
+    tokens_used: emittedTokens,
     tokens_budget: cfg.recallTokenBudget,
-    top_score: topScore,
+    top_score: pickedTopScore,
+    output_stats: {
+      emitted: Boolean(emittedBlock),
+      item_count: emittedCount,
+      content_item_count: emittedContentCount,
+      hint_item_count: emittedHintCount,
+      chars: emittedBlock.length,
+      estimated_tokens: emittedTokens,
+    },
+    endpoint_transport: "failed",
+    fallback_transport: fallbackRecall.transport,
     cc_session_id: sessionId,
     reason: "ok",
   });
-  approve(built?.block);
+  approve(emittedBlock);
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });

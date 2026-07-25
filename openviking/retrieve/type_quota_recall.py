@@ -341,6 +341,7 @@ async def search_type_quota_recall(
     roots = memory_target_roots(ctx)
     open_ctx = replace(ctx, actor_peer_id=None, legacy_agent_id=None)
     raw_by_type: dict[str, list[Any]] = {memory_type: [] for memory_type in TYPE_ORDER}
+    retrieved_by_type = dict.fromkeys(TYPE_ORDER, 0)
     selected: list[tuple[str, Any, int, str, RequestContext]] = []
 
     async def search_type(memory_type: str, quota: int) -> list[Any]:
@@ -388,8 +389,13 @@ async def search_type_quota_recall(
     )
 
     for (memory_type, quota), found in zip(active_types, found_by_type, strict=True):
+        deduped_found = _dedupe(found)
+        # ``searched`` predates funnel telemetry and intentionally keeps its existing semantics:
+        # actor-scoped calls count post-quota candidates while all-peer calls count pre-quota
+        # candidates. Record the unambiguous pre-quota count separately instead of changing it.
+        retrieved_by_type[memory_type] = len(deduped_found)
         if peer_scope == "all":
-            found = _dedupe(found)
+            found = deduped_found
             raw_by_type[memory_type] = found
             ranked = _limit_with_peer_penalties(
                 found,
@@ -400,7 +406,7 @@ async def search_type_quota_recall(
                 user_root=user_root,
             )
         else:
-            found = _limit(_dedupe(found), quota)
+            found = _limit(deduped_found, quota)
             raw_by_type[memory_type] = found
             ranked = [
                 (item, _origin_for_uri(_uri(item), ctx.actor_peer_id, user_root)) for item in found
@@ -416,6 +422,10 @@ async def search_type_quota_recall(
             )
             for rank, (item, origin) in enumerate(ranked, start=1)
         )
+
+    selected_by_type = dict.fromkeys(TYPE_ORDER, 0)
+    for memory_type, *_ in selected:
+        selected_by_type[memory_type] += 1
 
     entries: list[RecallEntry] = []
     fragments_by_type: dict[str, list[str]] = {key: [] for key in TYPE_ORDER}
@@ -437,10 +447,19 @@ async def search_type_quota_recall(
     preference_full_count = 0
     dropped = 0
     seen_content: set[int] = set()
+    excluded_by_type_reason = {
+        memory_type: {
+            "missing_or_profile_uri": 0,
+            "duplicate_content": 0,
+            "budget": 0,
+        }
+        for memory_type in TYPE_ORDER
+    }
 
     for index, (memory_type, item, rank, origin, read_ctx) in enumerate(selected, start=1):
         uri = _uri(item)
         if not uri or uri.rstrip("/").endswith("/profile.md"):
+            excluded_by_type_reason[memory_type]["missing_or_profile_uri"] += 1
             continue
         score = _score(item)
         abstract = _abstract(item)
@@ -458,6 +477,7 @@ async def search_type_quota_recall(
         if content_key:
             content_hash = hash(content_key)
             if content_hash in seen_content:
+                excluded_by_type_reason[memory_type]["duplicate_content"] += 1
                 continue
             seen_content.add(content_hash)
 
@@ -517,6 +537,7 @@ async def search_type_quota_recall(
                 fragment_chars = len(fragment) + (1 if total_chars else 0)
             if total_chars + fragment_chars > cap:
                 dropped += 1
+                excluded_by_type_reason[memory_type]["budget"] += 1
                 continue
             total_chars += fragment_chars
 
@@ -558,8 +579,12 @@ async def search_type_quota_recall(
             rendered = "\n".join(rendered_sections)
 
     origins = dict.fromkeys(ORIGIN_ORDER, 0)
+    returned_by_type = dict.fromkeys(TYPE_ORDER, 0)
+    returned_by_mode = dict.fromkeys(("full", "summary", "uri"), 0)
     for entry in entries:
         origins[entry.origin] = origins.get(entry.origin, 0) + 1
+        returned_by_type[entry.type] = returned_by_type.get(entry.type, 0) + 1
+        returned_by_mode[entry.mode] = returned_by_mode.get(entry.mode, 0) + 1
 
     return RecallResult(
         entries=entries,
@@ -568,8 +593,14 @@ async def search_type_quota_recall(
             "quotas": normalized_quotas,
             "roots": roots,
             "searched": {key: len(value) for key, value in raw_by_type.items()},
+            "retrieved_by_type": retrieved_by_type,
+            "selected_by_type": selected_by_type,
+            "returned_by_type": returned_by_type,
+            "returned_by_mode": returned_by_mode,
+            "excluded_by_type_reason": excluded_by_type_reason,
             "returned": len(entries),
             "dropped": dropped,
+            "rendered_chars": len(rendered),
             "max_chars": max_chars,
             "min_score": min_score,
             "peer_scope": peer_scope,
