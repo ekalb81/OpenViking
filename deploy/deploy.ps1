@@ -80,7 +80,7 @@ $templatePath = Join-Path $PSScriptRoot "ov.conf.template"
 if (-not (Test-Path $templatePath)) { Die "Missing $templatePath" }
 $rendered = (Get-Content $templatePath -Raw).
   Replace('${OPENVIKING_VLM_API_KEY}', $apiKey).
-  Replace('${OPENVIKING_HOME}', ($env:USERPROFILE -replace '\','/'))
+  Replace('${OPENVIKING_HOME}', $env:USERPROFILE.Replace('\', '/'))
 if ($rendered -match '\$\{[A-Z_]+\}') {
   Die "Unsubstituted placeholder(s) remain: $($Matches[0]). Refusing to write a broken config."
 }
