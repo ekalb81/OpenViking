@@ -89,6 +89,28 @@ _ADD_ONLY_DEDUPE_RATIO = 0.85
 _ADD_ONLY_DEDUPE_MAX_SIBLINGS = 24
 
 
+# A rendered memory file is scaffolding (frontmatter, the fields comment, and
+# headings) wrapped around a body. Strip the scaffolding to ask whether the body
+# said anything.
+_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}[^\n]*$", re.MULTILINE)
+
+
+def _rendered_body_is_empty(rendered: str) -> bool:
+    """True when a rendered memory file carries nothing beneath its scaffolding.
+
+    A memory whose body is only headings is worse than no memory at all: it
+    occupies a slot, is returned by recall, and says nothing when it gets there.
+    """
+    if not rendered:
+        return True
+    body = _FRONTMATTER_RE.sub("", rendered)
+    body = _HTML_COMMENT_RE.sub("", body)
+    body = _MARKDOWN_HEADING_RE.sub("", body)
+    return not body.strip()
+
+
 def _scrub_template_echo(value: str) -> str:
     """Remove extraction-prompt text the model echoed into a field value."""
     if not isinstance(value, str) or not value:
@@ -1671,6 +1693,17 @@ class MemoryUpdater:
                 content_template=schema.content_template,
                 extract_context=extract_context,
             )
+            # Templates render their headings unconditionally, so a field the
+            # model left blank still produces a well-formed file with nothing
+            # in it. Events are the live case: their template used to fall back
+            # to the raw chatlog when the summary was empty, and removing that
+            # fallback left the prompt's "REQUIRED" instruction as the only
+            # control. Refuse the write instead of storing an empty memory.
+            if _rendered_body_is_empty(new_full_content):
+                raise ValueError(
+                    f"Refusing to write {memory_type} memory with an empty body "
+                    f"(all fields blank after rendering): {uri}"
+                )
             await viking_fs.write_file(
                 uri,
                 new_full_content,
