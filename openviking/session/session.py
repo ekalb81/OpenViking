@@ -3932,7 +3932,11 @@ class Session:
                     "checkpoint_instructions": "",
                 },
             )
-            return await get_openviking_config().vlm.get_completion_async(prompt)
+            # Working memory runs on its own model; this fallback is still the
+            # working-memory job, so it must resolve the same override rather
+            # than silently falling back to the extraction model.
+            wm_vlm = get_openviking_config().vlm.for_working_memory()
+            return await wm_vlm.get_completion_async(prompt)
         except Exception as e:
             logger.warning(f"WM creation fallback failed: {e}")
             turn_count = len([m for m in messages if is_user_query(m)])

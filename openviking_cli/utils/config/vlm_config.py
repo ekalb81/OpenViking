@@ -668,10 +668,37 @@ class VLMConfig(BaseModel):
             raise ValueError(
                 f"vlm.working_memory has unknown field(s): {sorted(unknown)}"
             )
-        merged = self.model_copy(update=patch, deep=False)
-        # A nested override would be ambiguous - this config IS the resolved one.
-        merged.working_memory = None
-        return merged
+        # Rebuild through the constructor rather than model_copy. Two things
+        # here are produced by validators, and model_copy does not re-run them:
+        #
+        #  - `credentials`, which _normalize_credentials derives from the
+        #    top-level model/api_key. A copied config keeps a credential still
+        #    pinned to the PARENT's model, and get_vlm_instance prefers
+        #    `credential.model or self.model` - so the override resolved
+        #    correctly, reported the new model, and then called the old one.
+        #    In production that meant the working-memory model received zero
+        #    requests with no error anywhere.
+        #  - `_vlm_instance`, the memoised provider client, which would be
+        #    inherited wholesale.
+        #
+        # exclude_unset keeps inherited fields inherited.
+        base = self.model_dump(exclude_unset=True, exclude={"working_memory"})
+        base.update(patch)
+
+        # _normalize_credentials marks `credentials` as set, so exclude_unset
+        # does not drop it. Any credential that merely mirrors the top-level
+        # config was derived, not authored, and must be regenerated from the
+        # merged values - otherwise it pins the parent's model and wins.
+        # Credentials that differ were configured deliberately (failover across
+        # distinct endpoints) and are left alone.
+        derived = [
+            c for c in (base.get("credentials") or [])
+            if (c.get("model") or None) in (None, self.model)
+        ]
+        if derived and len(derived) == len(base.get("credentials") or []):
+            base.pop("credentials", None)
+
+        return type(self)(**base)
 
     def is_available(self) -> bool:
         """Check if LLM is configured."""

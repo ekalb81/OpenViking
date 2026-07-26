@@ -116,3 +116,42 @@ def test_a_typo_in_the_override_is_rejected_not_ignored():
 
     with pytest.raises(ValueError, match="unknown field"):
         parent.for_working_memory()
+
+
+def test_the_resolved_config_builds_its_own_provider_instance():
+    """The bug this exists to prevent.
+
+    VLMConfig memoises its provider client in a private attribute, and
+    model_copy carries private attributes across. Inheriting that cache defeats
+    the override completely: the config reports the new model while the cached
+    client keeps calling the old one. In production this showed up as the
+    working-memory model never receiving a single request, with no error
+    anywhere, because the name was right and only the object was wrong.
+    """
+    parent = _parent(working_memory={"model": "openrouter/z-ai/glm-5.2"})
+
+    # Build the parent's instance first, exactly as extraction does before the
+    # working-memory path ever runs.
+    parent_instance = parent.get_vlm_instance()
+    assert parent_instance.model == "openrouter/tencent/hy3-preview"
+
+    wm = parent.for_working_memory()
+    wm_instance = wm.get_vlm_instance()
+
+    assert wm_instance is not parent_instance
+    assert wm_instance.model == "openrouter/z-ai/glm-5.2"
+
+
+def test_the_creation_fallback_also_resolves_the_override():
+    """Both working-memory branches must resolve it, not just the update.
+
+    _fallback_generate_wm_creation re-fetches the config itself, so it needs its
+    own resolution; without it the branch that runs when there is no prior
+    working memory quietly uses the extraction model.
+    """
+    import inspect
+
+    from openviking.session import session as session_module
+
+    source = inspect.getsource(session_module.Session._fallback_generate_wm_creation)
+    assert "for_working_memory()" in source
