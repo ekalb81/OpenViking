@@ -98,6 +98,28 @@ else {
   Note "wrote $confPath"
 }
 
+# ------------------------------------------------------------------ stop first
+# The server must be down BEFORE installing. A running server holds its native
+# extensions open, and Windows refuses to replace a loaded .pyd: the first real
+# deploy failed on Crypto/Cipher/_raw_aes.pyd with "Access is denied" AFTER uv
+# had already staged 166 packages. That left the worst possible state - a live
+# server whose install was broken, still serving only because its modules were
+# already in memory, and guaranteed to fail on the next restart.
+Step "Stopping the server before touching the install"
+if ($DryRun) { Note "DRY RUN: would stop scheduled task '$TaskName' and any orphans" }
+else {
+  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 3
+  Get-Process | Where-Object { $_.Path -like "*uv\tools\openviking*" } | ForEach-Object {
+    Note "killing PID $($_.Id)"
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 3
+  $still = @(Get-Process | Where-Object { $_.Path -like "*uv\tools\openviking*" })
+  if ($still.Count) { Die "$($still.Count) process(es) still holding the install; refusing to install over a live server." }
+  Note "server stopped, nothing holding the files"
+}
+
 # --------------------------------------------------------------------- install
 if ($SkipInstall) { Step "Skipping install (-SkipInstall)" }
 else {
@@ -107,22 +129,18 @@ else {
     Push-Location $RepoRoot
     try {
       uv tool install --reinstall . 2>&1 | ForEach-Object { Note $_ }
-      if ($LASTEXITCODE -ne 0) { Die "uv tool install failed with exit code $LASTEXITCODE" }
+      if ($LASTEXITCODE -ne 0) {
+        Die ("uv tool install failed with exit code $LASTEXITCODE. The install may be " +
+             "partially applied - re-run this script before starting the server.")
+      }
     } finally { Pop-Location }
   }
 }
 
 # --------------------------------------------------------------------- restart
-Step "Restarting the server"
-if ($DryRun) { Note "DRY RUN: would restart scheduled task '$TaskName'" }
+Step "Starting the server"
+if ($DryRun) { Note "DRY RUN: would start scheduled task '$TaskName'" }
 else {
-  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 3
-  Get-Process | Where-Object { $_.Path -like "*uv\tools\openviking*" } | ForEach-Object {
-    Note "killing orphan PID $($_.Id)"
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-  }
-  Start-Sleep -Seconds 2
   Start-ScheduledTask -TaskName $TaskName
 
   Note "waiting for health (startup takes ~15-30s)"
