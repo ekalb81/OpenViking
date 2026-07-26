@@ -729,6 +729,26 @@ class Session:
         if not store:
             return hydrated
 
+        # Observation only - this deliberately does not cap anything.
+        #
+        # A session commits once it reaches commit_token_threshold (60k), but
+        # that is measured on the TRUNCATED transcript. Hydration then restores
+        # every externalized tool output to its full original size with no
+        # budget, so the prompt extraction actually receives can be far larger
+        # than the threshold implies. One 190k-token extraction prompt was
+        # recorded on 2026-07-26; traces rotate about every 13 hours at current
+        # volume, so there is no way to tell whether that recurs or was a
+        # one-off. This records the evidence needed to decide.
+        #
+        # The threshold mirrors ToolOutputExternalizationConfig's
+        # assistant_turn_inline_budget_chars (server/config.py), which is the
+        # codebase's existing statement of "this much inline tool output in one
+        # turn is a lot" - used here as a reporting line, not a limit.
+        hydration_report_threshold_chars = 100_000
+        hydrated_chars = 0
+        hydrated_parts = 0
+        largest_part_chars = 0
+
         for msg in hydrated:
             for part in msg.parts:
                 if not isinstance(part, ToolPart):
@@ -766,7 +786,35 @@ class Session:
                         exc,
                     )
                     continue
-                part.tool_output = result.get("content", "")
+                restored = result.get("content", "")
+                # Measure what hydration ADDED, not the absolute size: the
+                # truncated preview was already counted toward the commit
+                # threshold, so the growth is what the threshold did not see.
+                grew_by = max(0, len(restored) - len(part.tool_output or ""))
+                hydrated_chars += grew_by
+                hydrated_parts += 1
+                largest_part_chars = max(largest_part_chars, grew_by)
+                part.tool_output = restored
+
+        if hydrated_chars >= hydration_report_threshold_chars:
+            logger.warning(
+                "Tool-output hydration grew the extraction input well beyond the commit "
+                "threshold: session=%s added_chars=%d (~%d tokens) across %d tool output(s), "
+                "largest single output +%d chars. Hydration is currently unbounded; this is "
+                "a report, not a limit.",
+                self.session_id,
+                hydrated_chars,
+                hydrated_chars // 4,
+                hydrated_parts,
+                largest_part_chars,
+            )
+        elif hydrated_parts:
+            logger.debug(
+                "Tool-output hydration: session=%s added_chars=%d across %d output(s)",
+                self.session_id,
+                hydrated_chars,
+                hydrated_parts,
+            )
 
         return hydrated
 
