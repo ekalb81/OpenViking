@@ -1,0 +1,68 @@
+{
+  "memory": {},
+  "storage": {
+    "workspace": "${OPENVIKING_HOME}/.openviking/data"
+  },
+  "embedding": {
+    "dense": {
+      "provider": "ollama",
+      "model": "qwen3-embedding:8b",
+      "api_base": "http://localhost:11434/v1",
+      "dimension": 1024,
+      "input": "text"
+    }
+  },
+  "vlm": {
+    "provider": "litellm",
+    "model": "openrouter/tencent/hy3-preview",
+    "api_key": "${OPENVIKING_VLM_API_KEY}",
+    "api_base": "https://openrouter.ai/api/v1",
+    "temperature": 0.0,
+    "max_retries": 2,
+    "working_memory": {
+      "model": "openrouter/z-ai/glm-5.2"
+    }
+  },
+  "query_planner": {
+    "provider": "litellm",
+    "model": "ollama/guoxuter/ov_intent_analysis_sft:v7_q8",
+    "api_key": "no-key",
+    "api_base": "http://localhost:11434",
+    "temperature": 0.0,
+    "timeout": 60,
+    "extra_request_body": {
+      "think": false
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 1933,
+    "observability": {
+      "traces": {
+        "enabled": true,
+        "protocol": "local",
+        "local_path": "C:/Users/ekalb/.openviking/logs/traces.jsonl"
+      }
+    }
+  },
+  "ingest": {
+    "enabled": true,
+    "harnesses": {
+      "claude_code": {
+        "enabled": true,
+        "mode": "backfill",
+        "commit": {
+          "commit_token_threshold": 60000
+        }
+      },
+      "codex": {
+        "enabled": true,
+        "mode": "backfill",
+        "commit": {
+          "commit_token_threshold": 60000
+        }
+      }
+    },
+    "server_url": "http://127.0.0.1:1933"
+  }
+}
