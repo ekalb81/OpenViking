@@ -78,7 +78,7 @@ function emitAdditionalContext(additionalContext) {
   });
 }
 
-async function fetchJSON(path, init = {}) {
+async function fetchJSON(path, init = {}, actorPeerId = undefined) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.captureTimeoutMs);
   try {
@@ -89,7 +89,13 @@ async function fetchJSON(path, init = {}) {
     }
     if (cfg.sendIdentityHeaders && cfg.account) headers["X-OpenViking-Account"] = cfg.account;
     if (cfg.sendIdentityHeaders && cfg.user) headers["X-OpenViking-User"] = cfg.user;
-    if (activePeerId) headers["X-OpenViking-Actor-Peer"] = activePeerId;
+    // The actor peer scopes what the server will let this request touch. This
+    // hook commits OTHER sessions swept from a global state directory, so the
+    // caller must be able to say whose session it is committing - defaulting to
+    // this process's workspace claims the wrong peer and the server refuses the
+    // write. An explicit empty string means "do not claim a peer".
+    const actorPeer = actorPeerId === undefined ? activePeerId : actorPeerId;
+    if (actorPeer) headers["X-OpenViking-Actor-Peer"] = actorPeer;
     const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
     const body = await res.json().catch(() => null);
     if (!body) return null;
@@ -102,11 +108,12 @@ async function fetchJSON(path, init = {}) {
   }
 }
 
-async function commitOvSession(ovSessionId) {
+async function commitOvSession(ovSessionId, actorPeerId = undefined) {
   if (!ovSessionId) return null;
   return fetchJSON(
     `/api/v1/sessions/${encodeURIComponent(ovSessionId)}/commit`,
     { method: "POST", body: JSON.stringify({}) },
+    actorPeerId,
   );
 }
 
@@ -188,7 +195,15 @@ async function injectResumeArchive(newSessionId) {
 async function commitAndClear(state, reason) {
   if (state.ovSessionId) {
     const ovSessionId = state.ovSessionId;
-    const commit = await commitOvSession(state.ovSessionId);
+    // Commit as the session's OWN workspace, not this process's. The sweeps
+    // below iterate a global state directory holding sessions from every
+    // workspace, and the server scopes writes by the actor peer: claiming the
+    // wrong one made it refuse to write that session's memories at all.
+    //
+    // When the state predates this field, send no actor rather than guessing.
+    // An absent header leaves the peer view inactive, which is how the Claude
+    // Code plugin has always behaved; a wrong header loses the memory.
+    const commit = await commitOvSession(state.ovSessionId, state.workspacePeerId || "");
     if (!commit) {
       logError("commit_failed_keep_state", {
         reason,
