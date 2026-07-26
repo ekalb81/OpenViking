@@ -251,3 +251,36 @@ def test_production_compressor_wires_a_real_evaluator(monkeypatch):
     evaluator = compressor.rollout_analyzer.evaluator
     assert evaluator is not None, "analyzer would fall back to the fabricated passed=True evaluation"
     assert isinstance(evaluator, SessionCorrectionEvaluator)
+
+
+async def test_evaluator_requests_thinking_mode():
+    """Pairing a correction with the turn it corrects is a reasoning task, so thinking is on by default.
+
+    Safe only because this evaluator sends no tools: the provider rejects thinking combined with a
+    required/object tool_choice, which is what intermittently fails the tool-using extraction phases.
+    """
+    seen: dict[str, object] = {}
+
+    class RecordingVlm:
+        # **kwargs, so anything the call site actually passes is captured rather
+        # than asserted into existence by the fake itself.
+        async def get_completion_async(self, prompt: str, **kwargs):
+            seen["thinking"] = kwargs.get("thinking")
+            seen["kwargs"] = set(kwargs)
+            del prompt
+            return '{"corrections": []}'
+
+    evaluator = SessionCorrectionEvaluator(vlm=RecordingVlm())
+    rollout = Rollout(
+        case=Case(name="c", task_signature="t", input={}, rubric=Rubric("r", "d", [])),
+        messages=TRANSCRIPT,
+        policy_snapshot_id="snap",
+    )
+
+    await evaluator.evaluate(rollout)
+
+    assert seen["thinking"] is True
+    # The safety argument for thinking=True is that this call sends no tools.
+    # Adding one must fail here rather than at the provider.
+    assert "tools" not in seen["kwargs"]
+    assert "tool_choice" not in seen["kwargs"]

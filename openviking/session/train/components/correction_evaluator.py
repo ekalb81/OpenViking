@@ -41,8 +41,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from openviking.message import Message
-from openviking.session.train.domain import CriterionResult, Rollout, RubricEvaluation
 from openviking.session.memory.utils.json_parser import extract_json_content
+from openviking.session.train.domain import CriterionResult, Rollout, RubricEvaluation
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
@@ -275,7 +275,15 @@ class SessionCorrectionEvaluator:
     """A :class:`RolloutEvaluator` that grounds distillation in verified user corrections."""
 
     vlm: Any = None
-    thinking: bool | None = False
+    # Thinking mode, matching the extraction phases. Deciding whether a turn corrected an earlier one — and
+    # which earlier one — is a reasoning task, and a wrong pairing is exactly what the verifier then has to
+    # throw away, so it is worth the tokens to get the pairing right the first time.
+    #
+    # Safe here specifically because this evaluator sends no tools. Alibaba rejects thinking mode combined
+    # with a `required`/object tool_choice ("The tool_choice parameter does not support being set to
+    # required or object in thinking mode"), which is what intermittently fails the tool-using extraction
+    # phases; a plain prompt cannot hit that.
+    thinking: bool | None = True
 
     @tracer("train.correction_evaluator.evaluate", ignore_result=True, ignore_args=True)
     async def evaluate(self, rollout: Rollout, context: Any = None) -> RubricEvaluation:
