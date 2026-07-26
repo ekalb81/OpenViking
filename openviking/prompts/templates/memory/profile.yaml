@@ -3,15 +3,19 @@ description: |
   # Task Objective
   User profile memory - captures an identity summary of who the user is as a person.
   Extract relatively stable personal attributes that define the user's identity at a high level.
-  Include: profession, experience level, technical background, communication style, work habits, etc.
+  Include only: profession, broad technical background, communication style, and durable work preferences.
   Do NOT include transient conversation content or temporary mood states.
 
   # Rules
   - Each item: self-contained, declarative sentence, < 30 words
   - Extract only facts stated/confirmed by user; no guesses
-  - Focus on persistent information, not temporary situations
-  - Forbidden: events, only-assistant content, sensitive/private info, trivial updates
+  - Store only attributes expected to remain useful for months: profession, broad technical background, communication style, and durable work preferences
+  - Forbidden: project or repository names and paths; tasks, issues, pull requests, branches, commits, releases, implementation status, test/build/CI results or counts, environment configuration, current-session state, temporary goals, and dated progress
+  - Forbidden: events, only-assistant content, sensitive/private info, email addresses, usernames, account identifiers, credentials, financial positions, and trivial updates
+  - If the source contains only transient or forbidden information, produce no profile update
+  - Keep the complete profile concise: at most 12 bullets remaining after merging redundant ones
   - Merge similar items; keep latest if conflicting
+  - At the cap, add a new bullet only by replacing the least durable existing one; never exceed 12
 
 
 directory: "viking://user/{{ user_space }}/memories"
@@ -23,20 +27,14 @@ fields:
     description: |
       User profile content in Markdown format describing "who the user is".
       Use Markdown heading(s) with only the person's name, then bullets only; do not write paragraph bodies.
-      Includes relatively stable personal attributes: profession, experience, tech stack, communication style, etc.
-      Only record objective statuses, do not record events or similar information.
-      [IMPORTANT] For changeable statuses, must include the last updated time in the format: (as of 2023-06-09)
+      Include only relatively stable personal attributes: profession, broad technical background, communication style, and durable work preferences.
+      Do not record changeable statuses or dated project facts. Route project/task progress and operational outcomes to events or cases instead.
+      Never include repository paths, branch/commit/release details, test counts, account identifiers, credentials, or financial positions.
+      Keep the complete profile to at most 12 bullets; at the cap, replace the least durable bullet rather than adding a thirteenth.
       Example:
       # Caroline
-      - Date of birth
-      - Gender: Female
-      - Age: 25 (as of 2023-06-09)
-      - Nickname
-      - Place of origin
-      - Place of residence
-      - Regular city of residence
-      - Current occupation
-      - Relationship status: Single (as of 2023-06-09)
-      - Career plan
-      etc.
+      - Works as a software engineer.
+      - Has an advanced technical background.
+      - Prefers concise, evidence-backed communication.
+      - Values maintainable and privacy-conscious systems.
     merge_op: patch

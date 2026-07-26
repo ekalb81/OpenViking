@@ -793,11 +793,22 @@ class SessionCompressorV2:
                     isolation_handler=isolation_handler,
                 )
 
+            deduplicated = getattr(memory_result, "deduplicated_uris", {}) or {}
             tracer.info(
                 f"[{phase_label}] Applied memory ops: written={len(memory_result.written_uris)}, "
                 f"edited={len(memory_result.edited_uris)}, deleted={len(memory_result.deleted_uris)}, "
-                f"errors={len(memory_result.errors)}"
+                f"deduplicated={len(deduplicated)}, errors={len(memory_result.errors)}"
             )
+            if deduplicated and not memory_result.written_uris:
+                # Without this the only trace of a fully-deduplicated batch is
+                # the downstream "No trajectories extracted" line, which reads
+                # as an extraction failure rather than a batch of records that
+                # were all already stored.
+                tracer.info(
+                    f"[{phase_label}] All {len(deduplicated)} records were suppressed as "
+                    "duplicates of existing memories; downstream phases will report "
+                    "nothing extracted"
+                )
 
             if (
                 post_apply

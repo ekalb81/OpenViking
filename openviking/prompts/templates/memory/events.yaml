@@ -99,8 +99,6 @@ content_template: |
   {% else %}
   # Summary
   {{ summary }}
-  # {{extract_context.get_first_message_time_with_weekday_from_ranges(ranges|default(''))|default('N/A')}} ChatLog:
-  {{ extract_context.get_event_content(ranges, summary, 0) }}
   {% endif %}
 embedding_template: |-
   EventName: {{ event_name }}
@@ -136,6 +134,7 @@ fields:
   - name: summary
     type: string
     description: |
+      REQUIRED: output a non-empty, self-contained summary containing the durable fact and outcome. Never rely on raw chat text as a fallback.
       Based on the content of the above fields, compile a description to outline the complete Fact content.
       Use specific year-month-day dates instead of vague terms such as yesterday, last week, and tomorrow.
 

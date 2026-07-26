@@ -77,12 +77,35 @@ def test_profile_memory_template_includes_stable_identity_work_style_and_prefere
     )
 
     assert '"who the user is"' in text
-    assert "identity, work style, and preferences" in text
-    assert "profession, experience level, technical background" in text
-    assert "communication style, work habits" in text
+    assert "identity summary of who the user is" in text
+    # The Task Objective's "Include only" list and the Rules' durable-attribute
+    # list must name the same categories; an open-ended header would license
+    # exactly the transient facts the rules below forbid.
+    assert "profession, broad technical background, communication style, and durable work preferences" in text
     assert "Do NOT include transient conversation content" in text
     assert "Each item: self-contained" in text
-    assert "Only record objective statuses" in text
+    assert "expected to remain useful for months" in text
+    assert "Forbidden: project or repository names and paths" in text
+    assert "produce no profile update" in text
+    assert "Do not record changeable statuses" in text
+    assert "at most 12 bullets" in text
+    # A cap with no eviction rule leaves behaviour at the boundary undefined.
+    assert "replace the least durable" in text
+
+
+def test_trajectory_memory_template_is_accuracy_gated():
+    template_path = PromptManager._get_bundled_templates_dir() / "memory" / "trajectories.yaml"
+    schema = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    content_field = next(field for field in schema["fields"] if field["name"] == "content")
+    outcome_field = next(field for field in schema["fields"] if field["name"] == "outcome")
+
+    assert "line-number prefixes" in content_field["description"]
+    assert "completed post-action verification" in content_field["description"]
+    # The gate has to reach the outcome field too: that is where the literal
+    # token "success" lives, so gating only the prose leaves the enum ungated.
+    assert "completed post-action verification" in outcome_field["description"]
+    # A session that verifiably failed must still be able to say so.
+    assert "failure" in outcome_field["description"]
 
 
 def test_preferences_memory_template_keeps_topic_specific_preferences():
@@ -101,7 +124,7 @@ def test_preferences_memory_template_keeps_topic_specific_preferences():
     assert "specific topic" in text
     assert "code style, communication style, tools, workflow" in text
     assert "Store different topics as separate memory files" in text
-    assert "do not mix unrelated preferences" in text
+    assert "do NOT mix unrelated preferences" in text
 
 
 def test_prompt_manager_prefers_env_templates_dir_over_config(tmp_path, monkeypatch):

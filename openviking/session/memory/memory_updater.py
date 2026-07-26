@@ -58,6 +58,84 @@ logger = get_logger(__name__)
 
 _MEMORY_ABSTRACT_MAX_BYTES = 50_000
 _EXTRACTION_CHUNK_MIN_CHARS = 100
+
+# --- Ingestion hygiene ---
+# Models occasionally echo the extraction prompt back into field values, and
+# tool output pasted into a field can carry whole-document line-number prefixes.
+# Both survive into the stored memory and its embedding unless scrubbed here.
+#
+# An earlier revision instead capped the raw chatlog that event memories used to
+# embed (observed at up to 470x the summary size). The events template no longer
+# renders a chatlog at all, so the cap and its noise regexes were removed rather
+# than left unreachable.
+#
+# Fingerprints of extraction-prompt text that models occasionally echo back
+# into field values (observed: trajectories retrieval_anchor "Rules:" block and
+# its format-spec placeholder line).
+_TEMPLATE_ECHO_FINGERPRINTS = (
+    "Keep it shorter and more retrieval-focused than content",
+    "positive applies-when language",
+    "Do not copy the opening request when the reusable lesson",
+)
+_TEMPLATE_PLACEHOLDER_FINGERPRINTS = (
+    "operation, check, handoff, or response this record can guide",
+    "verified reusable condition; Capability:",
+)
+_RULES_BLOCK_RE = re.compile(r"\n\s*Rules:\s*\n.*\Z", re.DOTALL)
+_LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*(\d+)\t ?(.*)$")
+# Similarity threshold above which two add_only memories from the same batch or
+# the same source session are treated as duplicates.
+_ADD_ONLY_DEDUPE_RATIO = 0.85
+_ADD_ONLY_DEDUPE_MAX_SIBLINGS = 24
+
+
+def _scrub_template_echo(value: str) -> str:
+    """Remove extraction-prompt text the model echoed into a field value."""
+    if not isinstance(value, str) or not value:
+        return value
+    match = _RULES_BLOCK_RE.search(value)
+    if match and any(fp in match.group(0) for fp in _TEMPLATE_ECHO_FINGERPRINTS):
+        value = value[: match.start()].rstrip()
+    if any(fp in value for fp in _TEMPLATE_PLACEHOLDER_FINGERPRINTS):
+        lines = [
+            line
+            for line in value.splitlines()
+            if not any(fp in line for fp in _TEMPLATE_PLACEHOLDER_FINGERPRINTS)
+        ]
+        value = "\n".join(lines).strip()
+    return value
+
+
+def _strip_line_number_artifact(value: str) -> str:
+    """Remove one or more whole-document ``line_number<TAB>`` layers."""
+    if not isinstance(value, str) or not value:
+        return value
+    cleaned_value = value
+    while True:
+        lines = cleaned_value.splitlines()
+        populated = [(index, line) for index, line in enumerate(lines) if line.strip()]
+        if len(populated) < 3:
+            return cleaned_value
+        matches = [_LINE_NUMBER_PREFIX_RE.match(line) for _, line in populated]
+        if any(match is None for match in matches):
+            return cleaned_value
+        numbers = [int(match.group(1)) for match in matches if match is not None]
+        # Deliberately uneven: pairs each number with its successor, so the last
+        # number has no partner and strict=True would raise.
+        if any(
+            current != previous + 1
+            for previous, current in zip(numbers, numbers[1:], strict=False)
+        ):
+            return cleaned_value
+        cleaned = list(lines)
+        for (index, _), match in zip(populated, matches, strict=True):
+            cleaned[index] = match.group(2)
+        next_value = "\n".join(cleaned)
+        if next_value == cleaned_value:
+            return cleaned_value
+        cleaned_value = next_value
+
+
 _EXTRACTION_CHUNK_BOUNDARY_RE = re.compile(r"(\n+|[。！？；!?;]+|(?<!\d)\.(?!\d))")
 _RESOURCE_ADDITION_FIELD_RE = re.compile(
     r"^(Resource URI|Source name|Added at|Resource abstract|User reason):\s*(.*)$",
@@ -687,7 +765,8 @@ class MessageRange:
             if not current_messages:
                 return
             content = self._format_merged_content(current_messages)
-            formatted.append(f"**{self._speaker_for(current_messages[0])}**: {content}")
+            if content.strip():
+                formatted.append(f"**{self._speaker_for(current_messages[0])}**: {content}")
             current_messages = []
 
         for msg in msg_group:
@@ -780,9 +859,27 @@ class MemoryUpdateResult:
         self.deleted_uris: List[str] = []
         self.index_pending_uris: List[str] = []
         self.errors: List[Tuple[str, Exception]] = []
+        # Declared URI -> the already-stored URI that made writing it redundant.
+        # Deliberately not folded into written_uris: nothing was written, and a
+        # caller asking "what did this produce" must not be told otherwise. But
+        # a suppressed duplicate is a satisfied request, not a failed one, so
+        # callers that gate on "did this URI land" consult this too.
+        self.deduplicated_uris: Dict[str, str] = {}
 
     def add_written(self, uri: str) -> None:
         self.written_uris.append(uri)
+
+    def add_deduplicated(self, uri: str, existing_uri: str) -> None:
+        self.deduplicated_uris[uri] = existing_uri
+
+    def satisfied_uris(self) -> set:
+        """URIs whose content is present in the store after this update.
+
+        Written, edited, and deduplicated alike — a duplicate that was skipped
+        is still backed by a real file, so anything checking for a resolvable
+        endpoint should treat it as present.
+        """
+        return set(self.written_uris) | set(self.edited_uris) | set(self.deduplicated_uris)
 
     def add_edited(self, uri: str) -> None:
         self.edited_uris.append(uri)
@@ -802,6 +899,7 @@ class MemoryUpdateResult:
             f"Written: {len(self.written_uris)}, "
             f"Edited: {len(self.edited_uris)}, "
             f"Deleted: {len(self.deleted_uris)}, "
+            f"Deduplicated: {len(self.deduplicated_uris)}, "
             f"Index pending: {len(self.index_pending_uris)}, "
             f"Errors: {len(self.errors)}"
         )
@@ -1054,6 +1152,10 @@ class MemoryUpdater:
             )
             return result
 
+        # Drop near-duplicate add_only operations (same batch or re-extraction
+        # of the same source session) before applying anything.
+        applicable_upserts = await self._drop_duplicate_add_only(applicable_upserts, ctx, result)
+
         # Apply unified operations - _apply_edit returns True if edited, False if written
         attempted_experience_uris: List[str] = []
         experience_apply_failed = False
@@ -1098,7 +1200,11 @@ class MemoryUpdater:
         declared_upsert_uris = {
             uri for operation in operations.upsert_operations for uri in operation.uris
         }
-        successful_upsert_uris = set(result.written_uris + result.edited_uris)
+        # Includes URIs suppressed as duplicates: their content is in the store
+        # under an equivalent URI, so treating them as unlanded would refuse
+        # their links and, when the counterpart is an experience, roll back the
+        # whole experience batch over a write that was correctly skipped.
+        successful_upsert_uris = result.satisfied_uris()
         failed_replacement_deletes: set[str] = set()
         safe_delete_replacements: dict[str, str] = {}
         for deleted_uri, replacement_uri in dict(
@@ -1424,6 +1530,14 @@ class MemoryUpdater:
 
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
+        # Scrub known extraction artifacts from LLM-produced string fields
+        # before any of them reach metadata or merge_op processing.
+        for field_name, field_value in list(resolved_op.memory_fields.items()):
+            if isinstance(field_value, str):
+                cleaned_value = _scrub_template_echo(field_value)
+                if field_name == "content":
+                    cleaned_value = _strip_line_number_artifact(cleaned_value)
+                resolved_op.memory_fields[field_name] = cleaned_value
         if memory_type == "experiences":
             final_experience_errors = validate_experience_operations([resolved_op])
             if final_experience_errors:
@@ -1591,6 +1705,169 @@ class MemoryUpdater:
                     if link.to_uri in op.uris:
                         op._incoming_backlinks_by_uri[link.to_uri].append(link)
                         break
+
+    @staticmethod
+    def _dedupe_text_from_fields(fields: Dict[str, Any]) -> str:
+        text = str((fields or {}).get("content") or (fields or {}).get("summary") or "")
+        # Apply the same scrubbing _apply_upsert will apply before this text is
+        # written. Sibling files were scrubbed before they landed, so comparing
+        # an unscrubbed incoming field against them lets an echoed template
+        # block or a line-number prefix push the ratio below the threshold —
+        # defeating the check in exactly the cases it was written for.
+        text = _strip_line_number_artifact(_scrub_template_echo(text))
+        return re.sub(r"\s+", " ", text).strip().lower()[:4000]
+
+    @staticmethod
+    def _dedupe_text_from_file(raw: Any) -> str:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        text = re.sub(r"<!--\s*MEMORY_FIELDS.*?-->", "", text, flags=re.DOTALL)
+        text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.DOTALL)
+        # Events embed the chatlog below the "ChatLog:" heading; compare only
+        # the distilled part, mirroring _dedupe_text_from_fields using summary.
+        text = re.split(r"\n#[^\n]*ChatLog:\n", text)[0]
+        text = text.replace("# Summary", " ")
+        return re.sub(r"\s+", " ", text).strip().lower()[:4000]
+
+    async def _drop_duplicate_add_only(
+        self,
+        ops: List[ResolvedOperation],
+        ctx: RequestContext,
+        result: Optional["MemoryUpdateResult"] = None,
+    ) -> List[ResolvedOperation]:
+        """Suppress near-duplicate add_only operations.
+
+        Catches two observed failure modes: one extraction emitting several
+        same-content records under different names, and a re-run (backfill)
+        re-extracting a session whose records already exist on disk.
+
+        Every suppressed operation is recorded on ``result`` against the URI
+        that made it redundant. Callers downstream gate on whether a declared
+        URI landed; without that record a suppressed duplicate is
+        indistinguishable from a failed write.
+        """
+        from difflib import SequenceMatcher
+
+        kept: List[ResolvedOperation] = []
+        kept_add_only: List[Tuple[int, str, str]] = []  # (kept index, memory_type, text)
+
+        def _record(op: ResolvedOperation, existing_uri: str) -> None:
+            if result is None:
+                return
+            for uri in op.uris:
+                result.add_deduplicated(uri, existing_uri)
+
+        for op in ops:
+            schema = self._registry.get(op.memory_type) if self._registry else None
+            if not schema or getattr(schema, "operation_mode", None) != "add_only":
+                kept.append(op)
+                continue
+            # Compare on scrubbed text. Sibling files on disk were scrubbed
+            # before they were written, so comparing a raw incoming field
+            # against them would let the very artifacts this module strips
+            # depress the ratio and defeat the check.
+            text = self._dedupe_text_from_fields(op.memory_fields)
+            if not text:
+                kept.append(op)
+                continue
+            duplicate = False
+            for slot, (kept_idx, kept_type, kept_text) in enumerate(kept_add_only):
+                if kept_type != op.memory_type:
+                    continue
+                if SequenceMatcher(None, text, kept_text).ratio() < _ADD_ONLY_DEDUPE_RATIO:
+                    continue
+                duplicate = True
+                if len(text) > len(kept_text):
+                    loser = kept[kept_idx]
+                    tracer.info(
+                        f"[memory_updater] same-batch near-duplicate {op.memory_type}: "
+                        f"replacing {loser.uris} with richer {op.uris}"
+                    )
+                    kept[kept_idx] = op
+                    kept_add_only[slot] = (kept_idx, kept_type, text)
+                    # The richer op takes the slot, so it is the loser that was
+                    # suppressed and the winner's URI that now carries it.
+                    _record(loser, op.uris[0] if op.uris else "")
+                else:
+                    tracer.info(
+                        f"[memory_updater] dropping same-batch near-duplicate "
+                        f"{op.memory_type} op: uris={op.uris}"
+                    )
+                    _record(op, kept[kept_idx].uris[0] if kept[kept_idx].uris else "")
+                break
+            if duplicate:
+                continue
+            existing_uri = await self._duplicates_existing_sibling(op, text, ctx)
+            if existing_uri:
+                tracer.info(
+                    f"[memory_updater] skipping add_only op duplicating existing "
+                    f"memory {existing_uri}: uris={op.uris}"
+                )
+                _record(op, existing_uri)
+                continue
+            kept_add_only.append((len(kept), op.memory_type, text))
+            kept.append(op)
+        return kept
+
+    async def _duplicates_existing_sibling(
+        self, op: ResolvedOperation, text: str, ctx: RequestContext
+    ) -> Optional[str]:
+        """Return the URI of an existing sibling this add_only op duplicates."""
+        from difflib import SequenceMatcher
+
+        viking_fs = self._get_viking_fs()
+        if not viking_fs or not op.uris:
+            return None
+        uri = op.uris[0]
+        parent, _, name = uri.rpartition("/")
+        if not parent:
+            return None
+        # Timestamped add_only names (trajectories) only need comparing against
+        # siblings from the same source session.
+        ts_match = re.search(r"_(\d{14})\.md$", name)
+        try:
+            entries = await viking_fs.ls(parent, ctx=ctx)
+        except Exception as exc:
+            # Silence here would turn the whole check into a permanent no-op
+            # with no signal that it had stopped working.
+            logger.warning(f"[memory_updater] add_only dedupe could not list {parent}: {exc}")
+            return None
+        candidates: List[str] = []
+        for entry in entries or []:
+            entry_name = entry.get("name", "")
+            if entry.get("isDir") or not entry_name.endswith(".md") or entry_name.startswith("."):
+                continue
+            if entry_name == name:
+                continue
+            if ts_match and ts_match.group(1) not in entry_name:
+                continue
+            candidates.append(entry.get("uri") or f"{parent}/{entry_name}")
+        # ls order is backend-defined. Untimestamped add_only types (events)
+        # can exceed the cap in one directory, so sort before truncating or
+        # which duplicates get caught varies run to run.
+        candidates.sort()
+        truncated = len(candidates) - _ADD_ONLY_DEDUPE_MAX_SIBLINGS
+        if truncated > 0:
+            tracer.info(
+                f"[memory_updater] add_only dedupe comparing "
+                f"{_ADD_ONLY_DEDUPE_MAX_SIBLINGS} of {len(candidates)} siblings in "
+                f"{parent}; {truncated} not compared"
+            )
+        for sibling_uri in candidates[:_ADD_ONLY_DEDUPE_MAX_SIBLINGS]:
+            try:
+                raw = await viking_fs.read_file(sibling_uri, ctx=ctx)
+            except Exception as exc:
+                logger.warning(
+                    f"[memory_updater] add_only dedupe could not read {sibling_uri}: {exc}"
+                )
+                continue
+            if not raw:
+                continue
+            sibling_text = self._dedupe_text_from_file(raw)
+            if not sibling_text:
+                continue
+            if SequenceMatcher(None, text, sibling_text).ratio() >= _ADD_ONLY_DEDUPE_RATIO:
+                return sibling_uri
+        return None
 
     async def _apply_links_to_existing_files(
         self,

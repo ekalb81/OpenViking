@@ -33,6 +33,9 @@ fields:
     type: string
     description: |
       Use exactly one of: success, failure, partial, unfinished, unknown.
+      Choose success only when the session contains completed post-action verification; without it use
+      failure, partial, unfinished, or unknown, whichever the evidence supports. This must agree with
+      the Result and Evidence lines in content.
     merge_op: immutable
 
   - name: retrieval_anchor
@@ -83,6 +86,8 @@ fields:
       - Evidence: <brief generalized source note from this session, including success/failure/partial status, without digits, raw identifiers, personal names, contact values, exact amounts, exact counts, exact dates, locations, paths, or other instance-local values>
 
       Rules:
+      - Never copy source line-number prefixes from tool output into content: no `line_number<TAB>`, `cat -n`, or `nl -ba` prefixes. Numbered list items in the Procedure and Preconditions sections are required and are not affected by this rule.
+      - Claim success in Result or Evidence only when the session contains completed post-action verification; otherwise state the verified boundary using failure, partial, unfinished, or unknown, and keep it consistent with the outcome field.
       - Write for future agent execution. Capture the reusable contract: trigger -> prerequisites -> read/verify -> confirm if needed -> one primary write, handoff, or final response -> verify/communicate result.
       - Extract one record per reusable operation boundary: one primary user intent, one primary tool-effect target, and one lifecycle or reporting boundary. The boundary is narrower than the Family enum: two actions with the same Family still need separate records when they affect different sub-objects, collections, lifecycle states, write-field provenance, or continuation policies.
       - Split separable intents, pivots, follow-ups, prerequisite-only reads, state-changing actions, and final user-visible responses when they are independently reusable; omit low-value side work. The split rule is structural: separate by target, effect, provenance, lifecycle, and continuation boundary, not by any domain-specific workflow name.

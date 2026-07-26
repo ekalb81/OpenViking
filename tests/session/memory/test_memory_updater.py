@@ -26,6 +26,7 @@ from openviking.session.memory.memory_updater import (
     ExtractContext,
     MemoryUpdater,
     MemoryUpdateResult,
+    _strip_line_number_artifact,
 )
 from openviking.session.memory.merge_op import (
     FieldType,
@@ -60,6 +61,18 @@ class TestMemoryUpdateResult:
 
 class TestMemoryUpdater:
     """Tests for MemoryUpdater."""
+
+    def test_strip_line_number_artifact_from_generated_memory(self):
+        content = "1\t1\t# operation\n2\t2\t- Trigger: verified state\n3\t3\t- Result: success"
+
+        assert _strip_line_number_artifact(content) == (
+            "# operation\n- Trigger: verified state\n- Result: success"
+        )
+
+    def test_preserve_non_artifact_numbered_content(self):
+        content = "1\tfirst column\nnot a prefixed line\n3\tthird column"
+
+        assert _strip_line_number_artifact(content) == content
 
     def test_extract_context_initializes_page_id_map(self):
         extract_context = ExtractContext(
@@ -156,6 +169,49 @@ class TestMemoryUpdater:
         content = extract_context.get_event_content("0", "")
 
         assert "Gina can expand her clothing store now." in content
+
+    def test_event_template_keeps_summary_without_raw_chatlog(self):
+        raw_message_sentinel = "RAW_CHAT_SENTINEL must not be persisted"
+        extract_context = ExtractContext(
+            messages=[
+                Message(
+                    id="1",
+                    role="user",
+                    parts=[TextPart(text=raw_message_sentinel)],
+                    created_at="2026-07-24T00:00:00",
+                )
+            ]
+        )
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.load_from_yaml(
+            str(PromptManager._get_bundled_templates_dir() / "memory" / "events.yaml")
+        )
+
+        rendered = MemoryFileUtils.write(
+            MemoryFile(
+                extra_fields={
+                    "event_name": "cleanup_completed",
+                    "goal": "record cleanup",
+                    "summary": "The approved cleanup completed successfully.",
+                    "ranges": "0",
+                    "source_extraction_id": "extract-123",
+                    "last_update_trace_id": "trace-456",
+                    "memory_type": "events",
+                }
+            ),
+            content_template=registry.get("events").content_template,
+            extract_context=extract_context,
+        )
+        parsed = parse_memory_file_with_fields(rendered)
+
+        assert rendered.startswith(
+            "# Summary\nThe approved cleanup completed successfully."
+        )
+        assert raw_message_sentinel not in rendered
+        assert "ChatLog:" not in rendered
+        assert parsed["ranges"] == "0"
+        assert parsed["source_extraction_id"] == "extract-123"
+        assert parsed["last_update_trace_id"] == "trace-456"
 
     def test_create(self):
         """Test creating a MemoryUpdater."""
