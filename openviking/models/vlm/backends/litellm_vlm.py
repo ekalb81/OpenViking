@@ -142,6 +142,49 @@ def _has_litellm_prefix(model: str, prefixes: tuple[str, ...]) -> bool:
     return model.lower().startswith(prefixes)
 
 
+# Model-name fragments that support cache_control through OpenRouter but are
+# missing from LiteLLM's own allowlist. See _extend_openrouter_cache_control.
+_EXTRA_CACHE_CONTROL_MODELS: tuple[str, ...] = ("qwen",)
+
+
+def _extend_openrouter_cache_control() -> None:
+    """Let cache_control reach OpenRouter for models LiteLLM does not know about.
+
+    LiteLLM gates cache_control on a hardcoded substring allowlist - claude,
+    gemini, minimax, glm, z-ai - and strips the marker from every content block
+    for anything else, before the request leaves the process. Qwen is absent from
+    that list but Alibaba does support explicit caching through OpenRouter:
+    marking a 17.5k-token prefix reports cache_write_tokens=17504 on the first
+    call and cached_tokens=17504 on the next, and drops the prompt cost from
+    $0.00329 to $0.00033. Without this the marker we set is silently discarded
+    and every call pays full price.
+
+    Patching rather than forking because the surrounding logic - where the flag
+    is stripped from, and how tools are handled - is LiteLLM's to own. If the
+    internals move, this no-ops and we are back to the stock behaviour.
+    """
+    try:
+        from litellm.llms.openrouter.chat.transformation import OpenrouterConfig
+    except Exception:  # pragma: no cover - litellm internals moved
+        logger.debug("litellm openrouter transformation not found; cache_control left as-is")
+        return
+
+    original = getattr(OpenrouterConfig, "_supports_cache_control_in_content", None)
+    if original is None or getattr(original, "_openviking_extended", False):
+        return
+
+    def _supports_cache_control_in_content(self, model: str) -> bool:
+        if original(self, model):
+            return True
+        return any(fragment in model.lower() for fragment in _EXTRA_CACHE_CONTROL_MODELS)
+
+    _supports_cache_control_in_content._openviking_extended = True  # type: ignore[attr-defined]
+    OpenrouterConfig._supports_cache_control_in_content = _supports_cache_control_in_content
+
+
+_extend_openrouter_cache_control()
+
+
 def detect_provider_by_model(model: str) -> str | None:
     """Detect provider by model name."""
     if _has_litellm_prefix(model, EXPLICIT_LITELLM_PREFIXES):
