@@ -92,6 +92,19 @@ class VLMConfig(BaseModel):
 
     thinking: bool = Field(default=False, description="Enable thinking mode for VolcEngine models")
 
+    working_memory: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional VLM override for the working-memory update only, e.g. "
+            '{"model": "openrouter/z-ai/glm-5.2"}. Extraction and working memory are '
+            "different jobs with different economics: extraction runs roughly eleven "
+            "calls per commit and dominates spend, while the working-memory update is a "
+            "single forced tool call whose output seeds every later session. This is a "
+            "patch, not a whole config - only the keys present here override the parent, "
+            "and credentials, api_base and timeouts are inherited."
+        ),
+    )
+
     max_concurrent: int = Field(
         default=64, description="Maximum number of concurrent LLM calls for semantic processing"
     )
@@ -635,6 +648,30 @@ class VLMConfig(BaseModel):
             tool_choice=tool_choice,
             messages=messages,
         )
+
+    def for_working_memory(self) -> "VLMConfig":
+        """Return the config the working-memory update should use.
+
+        Without a ``working_memory`` block this is the same object, so the
+        default stays exactly one model for everything. With one, the override's
+        explicitly-set fields win and the rest are inherited - a caller should
+        not have to restate credentials to change a model name.
+        """
+        patch = {k: v for k, v in (self.working_memory or {}).items()
+                 if k != "working_memory"}
+        if not patch:
+            return self
+        unknown = set(patch) - set(type(self).model_fields)
+        if unknown:
+            # Silently ignoring a typo would leave the override looking applied
+            # while the parent model kept running.
+            raise ValueError(
+                f"vlm.working_memory has unknown field(s): {sorted(unknown)}"
+            )
+        merged = self.model_copy(update=patch, deep=False)
+        # A nested override would be ambiguous - this config IS the resolved one.
+        merged.working_memory = None
+        return merged
 
     def is_available(self) -> bool:
         """Check if LLM is configured."""

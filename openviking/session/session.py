@@ -3648,7 +3648,11 @@ class Session:
         formatted = self._format_messages_for_wm(messages, checkpoint_requests)
         checkpoint_instructions = self._checkpoint_prompt_instructions(len(checkpoint_requests))
 
+        # Working memory may run on a different model than extraction; see
+        # VLMConfig.working_memory. Resolves to the same config when unset.
         vlm = get_openviking_config().vlm
+        if vlm is not None:
+            vlm = vlm.for_working_memory()
         if not (vlm and vlm.is_available()):
             if checkpoint_requests:
                 raise ValueError("A configured VLM is required to generate checkpoint summaries")
