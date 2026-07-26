@@ -357,6 +357,21 @@ class LiteLLMVLMProvider(VLMBase):
             extra["enable_thinking"] = self._effective_thinking(thinking)
             kwargs["extra_body"] = extra
 
+        # OpenRouter exposes thinking through its own `reasoning` parameter.
+        # `enable_thinking` above is DashScope-native and OpenRouter does not
+        # translate it, so before this there was no way to control thinking for
+        # an OpenRouter-hosted model and the provider default always won. For
+        # Qwen3 that default is thinking-on, which the provider then refuses to
+        # combine with a forced tool_choice:
+        #   "The tool_choice parameter does not support being set to required
+        #    or object in thinking mode"
+        # Sent only when the caller stated an intent; leaving `thinking` as None
+        # keeps the provider default for every call that does not care.
+        if provider == "openrouter" and thinking is not None:
+            extra = kwargs.get("extra_body", {})
+            extra.setdefault("reasoning", {"enabled": bool(thinking)})
+            kwargs["extra_body"] = extra
+
         # Workaround for LiteLLM bug where Gemini context-caching path emits
         # both `cachedContent` and `toolConfig`, which Gemini rejects with a
         # 400 "CachedContent can not be used with GenerateContent request

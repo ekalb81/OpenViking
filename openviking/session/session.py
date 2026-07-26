@@ -3753,6 +3753,13 @@ class Session:
                     "type": "function",
                     "function": {"name": "update_working_memory"},
                 },
+                # Forcing a specific tool is incompatible with thinking mode on
+                # at least one provider (Alibaba/Qwen rejects an object
+                # tool_choice while thinking), and this call depends on the
+                # forced tool: without it there are no per-section decisions to
+                # merge and the whole update degrades to a recreation. State the
+                # intent here rather than inheriting a provider default.
+                thinking=False,
             )
         except Exception as e:
             import traceback as _tb
