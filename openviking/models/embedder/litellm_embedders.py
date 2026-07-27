@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Optional
 
 import litellm
 
-from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
+from openviking.models.embedder.base import (
+    DenseEmbedderBase,
+    EmbedResult,
+    truncate_and_normalize,
+)
 from openviking.telemetry import get_current_telemetry
 from openviking_cli.utils import get_logger
 
@@ -87,17 +91,23 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
         self._dimension = dimension
 
     def _truncate_vector(self, vector: List[float]) -> List[float]:
-        """Truncate vector to target dimension if needed.
+        """Truncate to the configured dimension and restore unit length.
+
+        Truncating a unit vector leaves it shorter than 1 - dropping 3/4 of a
+        Qwen3 embedding gives a norm near 0.5. Every other embedder routes
+        through ``truncate_and_normalize``, so vectors already in a collection
+        are unit length; emitting unnormalized ones from this path would make
+        the index inhomogeneous, and any similarity that is not cosine would
+        then score new vectors systematically below old ones with no error.
 
         Args:
             vector: Input vector from API
 
         Returns:
-            Truncated vector if dimension is set and smaller than input, otherwise original vector
+            The vector truncated to ``dimension`` and L2-normalized, or
+            unchanged when no truncation applies.
         """
-        if self.dimension is not None and len(vector) > self.dimension:
-            return vector[: self.dimension]
-        return vector
+        return truncate_and_normalize(vector, self.dimension)
 
     def _build_kwargs(self, is_query: bool = False) -> Dict[str, Any]:
         """Build kwargs dict for litellm.embedding() call."""
@@ -206,6 +216,12 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             response = await litellm.aembedding(**kwargs)
             self._update_telemetry_token_usage(response)
             vector = response.data[0]["embedding"]
+            # Truncate exactly as the sync path does. Without this the async
+            # path returns the model's native width - 4096 for Qwen3-Embedding
+            # - while the configured dimension, and therefore the vector
+            # collection, is narrower. Async is the path the server actually
+            # uses, so the mismatch reaches storage.
+            vector = self._truncate_vector(vector)
             return EmbedResult(dense_vector=vector)
 
         try:
