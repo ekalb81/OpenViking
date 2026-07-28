@@ -11,9 +11,11 @@
   tracked template, restarts the server, and records what was deployed so
   check-drift.ps1 can verify it later.
 
-  The API key is never stored in the repository. It is taken from
+  API keys are never stored in the repository. The VLM key is taken from
   $env:OPENVIKING_VLM_API_KEY, else carried over from the existing live config,
-  else read from 1Password when -OpRef is supplied.
+  else read from 1Password when -OpRef is supplied. The embedding provider is a
+  different vendor and carries its own key, resolved the same way from
+  $env:OPENVIKING_EMBED_API_KEY, the live config, or -EmbedOpRef.
 
 .EXAMPLE
   pwsh deploy/deploy.ps1                 # full deploy
@@ -28,6 +30,7 @@ param(
   [string]$TaskName   = "OpenViking Server",
   [string]$HealthUrl  = "http://127.0.0.1:1933/health",
   [string]$OpRef      = "",
+  [string]$EmbedOpRef = "op://Personal/Voxel Forge API Credentials - OpenViking/credential",
   [switch]$SkipInstall,
   [switch]$AllowDirty,
   [switch]$DryRun
@@ -74,12 +77,37 @@ if (-not $apiKey) {
 }
 Note "key resolved from $source ($($apiKey.Length) chars, not logged)"
 
+# The embedding provider is a different vendor from the VLM, so it carries its
+# own credential. Same resolution order: environment, then the live config, then
+# 1Password.
+Step "Resolving the embedding API key"
+$embedKey = $env:OPENVIKING_EMBED_API_KEY
+$embedSource = "environment"
+if (-not $embedKey) {
+  $liveConf = Join-Path $OvHome "ov.conf"
+  if (Test-Path $liveConf) {
+    try {
+      $existing = (Get-Content $liveConf -Raw | ConvertFrom-Json).embedding.dense.api_key
+      if ($existing -and $existing -notmatch '^\$\{') { $embedKey = $existing; $embedSource = "existing live config" }
+    } catch { }
+  }
+}
+if (-not $embedKey -and $EmbedOpRef) {
+  $embedKey = (op read $EmbedOpRef 2>$null)
+  if ($LASTEXITCODE -eq 0 -and $embedKey) { $embedSource = "1Password ($EmbedOpRef)" } else { $embedKey = $null }
+}
+if (-not $embedKey) {
+  Die "No embedding API key available. Set OPENVIKING_EMBED_API_KEY, keep an existing ov.conf, or pass -EmbedOpRef."
+}
+Note "embedding key resolved from $embedSource ($($embedKey.Length) chars, not logged)"
+
 # ------------------------------------------------------------------ render conf
 Step "Rendering ov.conf from the tracked template"
 $templatePath = Join-Path $PSScriptRoot "ov.conf.template"
 if (-not (Test-Path $templatePath)) { Die "Missing $templatePath" }
 $rendered = (Get-Content $templatePath -Raw).
   Replace('${OPENVIKING_VLM_API_KEY}', $apiKey).
+  Replace('${OPENVIKING_EMBED_API_KEY}', $embedKey).
   Replace('${OPENVIKING_HOME}', $env:USERPROFILE.Replace('\', '/'))
 if ($rendered -match '\$\{[A-Z_]+\}') {
   Die "Unsubstituted placeholder(s) remain: $($Matches[0]). Refusing to write a broken config."

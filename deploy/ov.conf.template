@@ -6,11 +6,11 @@
   "embedding": {
     "dense": {
       "provider": "litellm",
-      "model": "openrouter/qwen/qwen3-embedding-8b",
-      "api_base": "https://openrouter.ai/api/v1",
+      "model": "openai/forge-turbo",
+      "api_base": "https://api.voxell.ai/v1",
       "dimension": 1024,
       "input": "text",
-      "api_key": "${OPENVIKING_VLM_API_KEY}"
+      "api_key": "${OPENVIKING_EMBED_API_KEY}"
     },
     "allow_metadata_override": true
   },
