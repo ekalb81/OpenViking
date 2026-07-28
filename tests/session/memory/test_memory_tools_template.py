@@ -28,7 +28,8 @@ def _tools_content_template() -> str:
     return yaml.safe_load(template_path.read_text(encoding="utf-8"))["content_template"]
 
 
-def test_tools_template_treats_none_counts_as_zero():
+def test_tools_template_reports_unmeasured_instead_of_zero_percent():
+    """A tool with no recorded calls must not read as a tool that always fails."""
     rendered = MemoryFileUtils.write(
         MemoryFile(
             extra_fields={
@@ -41,7 +42,8 @@ def test_tools_template_treats_none_counts_as_zero():
         content_template=_tools_content_template(),
     )
 
-    assert "- Success rate: 0% (0/0)" in rendered
+    assert "- Success rate: not measured (no calls recorded)" in rendered
+    assert "0% (0/0)" not in rendered
 
 
 def test_tools_template_keeps_success_rate_for_positive_counts():

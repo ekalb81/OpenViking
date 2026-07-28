@@ -13,8 +13,16 @@ from typing import Any, Dict, List
 
 
 def _dedup_key(link: Dict[str, Any]) -> str:
-    """Compute dedup key for a link."""
-    return f"{link.get('from_uri', '')}|{link.get('to_uri', '')}|{link.get('match_text', '')}"
+    """Compute dedup key for a link.
+
+    ``match_text`` is normalized because an absent key, ``None``, and ``""`` all
+    mean "no match text". Serialization omits the key when it is empty, so a
+    reloaded link must key the same as the freshly dumped link it came from --
+    otherwise every write appends a second copy of the same link.
+    """
+    return (
+        f"{link.get('from_uri') or ''}|{link.get('to_uri') or ''}|{link.get('match_text') or ''}"
+    )
 
 
 def merge_links(existing_links: List[Dict], new_links: List[Dict]) -> List[Dict]:

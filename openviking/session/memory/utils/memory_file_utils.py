@@ -61,6 +61,32 @@ def _deserialize_datetime(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+# Link keys that carry no information when empty. StoredLink declares a default for
+# each, so a reloaded link is identical to one that stored the empty value verbatim.
+# ``weight`` is deliberately excluded: its model default (0.5) is not the value the
+# writer usually emits (1.0), so omitting it would change the link on reload.
+_OMITTABLE_EMPTY_LINK_KEYS = ("match_text", "description")
+
+
+def _compact_link(link: Any) -> Any:
+    """Drop link keys whose value is empty, so the trailer stops storing nulls."""
+    if not isinstance(link, dict):
+        return link
+    return {
+        key: value
+        for key, value in link.items()
+        if key not in _OMITTABLE_EMPTY_LINK_KEYS or value not in (None, "")
+    }
+
+
+def _compact_link_arrays(metadata: Dict[str, Any]) -> None:
+    """Compact every link entry in ``metadata`` in place."""
+    for key in ("links", "backlinks"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            metadata[key] = [_compact_link(link) for link in value]
+
+
 def _uri_basename(uri: str) -> str:
     name = str(uri or "").rstrip("/").rsplit("/", 1)[-1]
     return name.removesuffix(".md")
@@ -103,6 +129,8 @@ def _serialize_with_metadata(
     links = clean_metadata.get("links")
     if isinstance(links, list) and source_uri:
         content = LinkRenderer.render_links(content, str(source_uri), links)
+
+    _compact_link_arrays(clean_metadata)
 
     metadata_json = json.dumps(
         clean_metadata, indent=2, default=_serialize_datetime, ensure_ascii=False

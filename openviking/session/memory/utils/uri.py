@@ -14,6 +14,36 @@ from openviking.session.memory.utils.model import model_to_dict
 from openviking.session.memory.utils.template_utils import TemplateUtils
 
 
+_URI_FIELD_SEPARATOR_RE = re.compile(r"[\\/]+")
+_URI_FIELD_TRAVERSAL_RE = re.compile(r"\.{2,}")
+_URI_FIELD_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def sanitize_uri_field_value(value: Any) -> Any:
+    """Neutralize path separators and traversal in a URI template field value.
+
+    Field values reach :func:`generate_uri` straight from model output, so a
+    name like ``"WebFetch / WebSearch for GitHub"`` would otherwise be spliced
+    into the URI as a path separator: it silently creates a nested directory and
+    defeats :func:`_pattern_matches_uri`, which expands ``{{ variable }}`` to
+    ``[^/]+`` on the assumption that a field value never spans a path segment.
+    A value that spans segments therefore lands somewhere the allow-pattern was
+    not written to cover.
+
+    Trailing dots and spaces are also stripped because Windows drops them when
+    creating the file, which yields a path that no longer matches the URI the
+    caller recorded.
+
+    Non-string values pass through unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = _URI_FIELD_SEPARATOR_RE.sub("_", value)
+    cleaned = _URI_FIELD_TRAVERSAL_RE.sub("_", cleaned)
+    cleaned = _URI_FIELD_WHITESPACE_RE.sub(" ", cleaned).strip()
+    return cleaned.rstrip(" .")
+
+
 def render_template(
     template: str,
     fields: Dict[str, Any],
@@ -71,8 +101,12 @@ def generate_uri(
     else:
         uri_template = dir_template or filename_template
     context = {"user_space": user_space}
-    # Add all fields to context (uri_fields with actual values)
-    context.update(fields)
+    # Add all fields to context (uri_fields with actual values).
+    # Field values are model output, so they are confined to a single path segment
+    # and cannot move the memory out of the directory the schema declares.
+    # ``user_space`` is caller-supplied and legitimately carries path structure
+    # (peer scopes render as "<user>/peers/<peer_id>"), so it is left intact.
+    context.update({key: sanitize_uri_field_value(value) for key, value in fields.items()})
     template_vars = set(re.findall(r"\{\{\s*(\w+)\s*\}\}", uri_template))
     for var in template_vars:
         if var not in context:
