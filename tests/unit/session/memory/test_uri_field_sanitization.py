@@ -36,6 +36,12 @@ class TestSanitizeUriFieldValue:
         assert sanitize_uri_field_value(7) == 7
         assert sanitize_uri_field_value(None) is None
 
+    @pytest.mark.parametrize("value", ["   ", ".", ". .", "", " . . "])
+    def test_value_that_sanitizes_away_does_not_vanish(self, value):
+        # Rendering nothing would give the bare filename ".md": a dotfile that
+        # tools/*.md does not match, and one path every such value collides on.
+        assert sanitize_uri_field_value(value) == "_"
+
 
 def _tools_like_schema() -> MemoryTypeSchema:
     return MemoryTypeSchema(
@@ -55,6 +61,12 @@ class TestGenerateUri:
         )
         # The bug this guards: the name used to add path segments of its own.
         assert uri.count("/", len("viking://")) == 4
+
+    def test_field_that_sanitizes_away_still_yields_a_visible_filename(self):
+        uri = generate_uri(_tools_like_schema(), {"tool_name": ". ."})
+
+        assert uri == "viking://user/default/memories/tools/_.md"
+        assert not uri.endswith("/.md")
 
     def test_traversal_in_field_cannot_escape_the_directory(self):
         uri = generate_uri(_tools_like_schema(), {"tool_name": "../../../secrets"})

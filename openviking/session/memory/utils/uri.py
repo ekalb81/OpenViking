@@ -34,6 +34,12 @@ def sanitize_uri_field_value(value: Any) -> Any:
     creating the file, which yields a path that no longer matches the URI the
     caller recorded.
 
+    A value consisting only of whitespace and dots sanitizes to nothing, which
+    would render as the bare filename ``.md`` -- a dotfile that ``tools/*.md``
+    does not match, and one path that every such value collides on, so each
+    write would overwrite the last. Those collapse to ``_`` instead, which is
+    the same substitution the other rules make and stays inside the glob.
+
     Non-string values pass through unchanged.
     """
     if not isinstance(value, str):
@@ -41,7 +47,8 @@ def sanitize_uri_field_value(value: Any) -> Any:
     cleaned = _URI_FIELD_SEPARATOR_RE.sub("_", value)
     cleaned = _URI_FIELD_TRAVERSAL_RE.sub("_", cleaned)
     cleaned = _URI_FIELD_WHITESPACE_RE.sub(" ", cleaned).strip()
-    return cleaned.rstrip(" .")
+    cleaned = cleaned.rstrip(" .")
+    return cleaned or "_"
 
 
 def render_template(
