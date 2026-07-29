@@ -77,6 +77,13 @@ class QueueManager:
     # Throttle interval for repeated size-read failure logs (seconds).
     SIZE_ERROR_LOG_INTERVAL = 30.0
 
+    # In-process retry budget for handler failures that advertise retryable=True.
+    # The backoff is capped so a retrying task cannot hold its concurrency slot
+    # for much longer than a path lock takes to expire.
+    PROCESS_RETRY_LIMIT = 5
+    PROCESS_RETRY_BASE_DELAY = 5.0
+    PROCESS_RETRY_MAX_DELAY = 60.0
+
     def __init__(
         self,
         agfs: Any,
@@ -260,7 +267,7 @@ class QueueManager:
             async with sem:
                 msg_id = data.get("id", "") if isinstance(data, dict) else ""
                 try:
-                    await queue.process_dequeued(data)
+                    await self._process_with_retry(queue, data)
                     # Ack after successful processing (delete from persistent storage).
                     await queue.ack(msg_id)
                 except Exception as e:
@@ -324,6 +331,41 @@ class QueueManager:
                 for t in active_tasks:
                     t.cancel()
                 await asyncio.gather(*active_tasks, return_exceptions=True)
+
+    async def _process_with_retry(self, queue: NamedQueue, data: Dict[str, Any]) -> Any:
+        """Run the dequeue handler, retrying failures that advertise retryable=True.
+
+        A retryable failure is not a bad message. ResourceBusyError is the one
+        that matters here: a path lock orphaned by a crashed writer stays
+        "fresh" until it expires, so a write that lands inside that window is
+        rejected even though the condition clears itself minutes later.
+
+        Without an in-process retry such a message keeps its 'processing' row
+        and only the backend's RecoverStale, which runs at process start, puts
+        it back. That is not enough on its own: a restart re-runs the same race
+        against the same not-yet-expired lock, so the message can be parked
+        again immediately and stay parked across any number of restarts.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.PROCESS_RETRY_LIMIT + 1):
+            try:
+                return await queue.process_dequeued(data)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.PROCESS_RETRY_LIMIT or not getattr(exc, "retryable", False):
+                    raise
+                delay = min(
+                    self.PROCESS_RETRY_MAX_DELAY,
+                    self.PROCESS_RETRY_BASE_DELAY * (2**attempt),
+                )
+                logger.warning(
+                    f"[QueueManager] Retryable error for {queue.name} "
+                    f"(attempt {attempt + 1}/{self.PROCESS_RETRY_LIMIT}, "
+                    f"retrying in {delay:.0f}s): {exc}"
+                )
+                await asyncio.sleep(delay)
+        # Unreachable: the loop either returns or raises.
+        raise last_exc  # type: ignore[misc]
 
     def stop(self) -> None:
         """Stop QueueManager and release resources."""
