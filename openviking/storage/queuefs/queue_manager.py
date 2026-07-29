@@ -84,6 +84,13 @@ class QueueManager:
     PROCESS_RETRY_BASE_DELAY = 5.0
     PROCESS_RETRY_MAX_DELAY = 60.0
 
+    # Ceiling on a single handler run. A handler that never returns holds its
+    # concurrency slot for the life of the process, and SessionCommit only has
+    # four, so a handful of hangs starves the queue outright. Generous enough
+    # that a real session-commit extraction (a long chain of LLM calls) is
+    # never cut short.
+    PROCESS_TIMEOUT_SECONDS = 900.0
+
     def __init__(
         self,
         agfs: Any,
@@ -349,7 +356,20 @@ class QueueManager:
         last_exc: Optional[Exception] = None
         for attempt in range(self.PROCESS_RETRY_LIMIT + 1):
             try:
-                return await queue.process_dequeued(data)
+                return await asyncio.wait_for(
+                    queue.process_dequeued(data), timeout=self.PROCESS_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Deliberately not retried: a hang is not a transient conflict,
+                # and re-running it would tie the slot up for another full
+                # timeout. Free the slot and let RecoverStale re-queue the
+                # message at the next process start.
+                logger.error(
+                    f"[QueueManager] Handler for {queue.name} exceeded "
+                    f"{self.PROCESS_TIMEOUT_SECONDS:.0f}s and was cancelled; "
+                    f"releasing the worker slot"
+                )
+                raise
             except Exception as exc:
                 last_exc = exc
                 if attempt >= self.PROCESS_RETRY_LIMIT or not getattr(exc, "retryable", False):

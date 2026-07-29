@@ -98,3 +98,46 @@ async def test_cancellation_is_not_swallowed_by_the_retry_loop(manager):
     with pytest.raises(asyncio.CancelledError):
         await manager._process_with_retry(queue, {"id": "m1"})
     assert queue.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_hung_handler_is_cancelled_and_releases_the_slot(monkeypatch):
+    """A handler that never returns must not hold its concurrency slot forever.
+
+    SessionCommit runs four workers. Four hangs starve the queue for the life
+    of the process, and the only recovery is a restart -- which re-runs the
+    same work and can hang again.
+    """
+    monkeypatch.setattr(QueueManager, "PROCESS_TIMEOUT_SECONDS", 0.05)
+    mgr = QueueManager.__new__(QueueManager)
+
+    started = asyncio.Event()
+
+    class _HangingQueue(_FakeQueue):
+        async def process_dequeued(self, data):
+            self.attempts += 1
+            started.set()
+            await asyncio.Event().wait()  # never resolves
+
+    queue = _HangingQueue(failures=0)
+    with pytest.raises(asyncio.TimeoutError):
+        await mgr._process_with_retry(queue, {"id": "m1"})
+
+    assert started.is_set(), "the handler should have run"
+    assert queue.attempts == 1, "a hang must not be retried into another full timeout"
+    assert queue.acked == [], "a timed-out message must not be acked"
+
+
+@pytest.mark.asyncio
+async def test_slow_handler_within_the_ceiling_still_succeeds(monkeypatch):
+    monkeypatch.setattr(QueueManager, "PROCESS_TIMEOUT_SECONDS", 5.0)
+    mgr = QueueManager.__new__(QueueManager)
+
+    class _SlowQueue(_FakeQueue):
+        async def process_dequeued(self, data):
+            self.attempts += 1
+            await asyncio.sleep(0.05)
+            return data
+
+    queue = _SlowQueue(failures=0)
+    assert await mgr._process_with_retry(queue, {"id": "m1"}) == {"id": "m1"}
