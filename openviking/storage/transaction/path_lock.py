@@ -374,6 +374,22 @@ class PathLockEngine:
                 return True
             return False
 
+    async def _reclaim_stale_or_wait(self, lock_path: str, deadline: float) -> bool:
+        """Drop an expired lock; return False when the caller must give up.
+
+        Removal is not guaranteed — a racing owner may recreate the file, and
+        the tree may be unwritable. Retrying immediately on failure is an
+        unbounded hot loop with no deadline check, so a failed reclaim falls
+        back to the same poll-and-deadline path a live conflict takes.
+        """
+        if await self._remove_lock_file(lock_path):
+            return True
+        logger.warning(f"Failed to remove stale lock, will retry: {lock_path}")
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(_POLL_INTERVAL)
+        return True
+
     def is_lock_stale(self, lock_path: str, expire_seconds: float = 300.0) -> bool:
         token = self._read_token(lock_path)
         if token is None:
@@ -502,7 +518,8 @@ class PathLockEngine:
             if existing_exact_lock:
                 if await self._is_lock_stale_async(existing_exact_lock, self._lock_expire):
                     logger.warning(f"[EXACT] Removing stale exact lock: {existing_exact_lock}")
-                    await self._remove_lock_file(existing_exact_lock)
+                    if not await self._reclaim_stale_or_wait(existing_exact_lock, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(f"[EXACT] Timeout waiting for exact lock on: {path}")
@@ -525,7 +542,8 @@ class PathLockEngine:
                     if lock_owner != owner_id:
                         if await self._is_lock_stale_async(same_path_lock, self._lock_expire):
                             logger.warning(f"[EXACT] Removing stale lock: {same_path_lock}")
-                            await self._remove_lock_file(same_path_lock)
+                            if not await self._reclaim_stale_or_wait(same_path_lock, deadline):
+                                return False
                             continue
                         if asyncio.get_running_loop().time() >= deadline:
                             _log_timeout_waiting(f"[EXACT] Timeout waiting for lock: {path}")
@@ -539,7 +557,8 @@ class PathLockEngine:
                     logger.warning(
                         f"[EXACT] Removing stale ancestor TREE lock: {ancestor_conflict}"
                     )
-                    await self._remove_lock_file(ancestor_conflict)
+                    if not await self._reclaim_stale_or_wait(ancestor_conflict, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(
@@ -655,7 +674,8 @@ class PathLockEngine:
             if await self._is_locked_by_other(lock_path, owner_id):
                 if await self._is_lock_stale_async(lock_path, self._lock_expire):
                     logger.warning(f"[TREE] Removing stale lock: {lock_path}")
-                    await self._remove_lock_file(lock_path)
+                    if not await self._reclaim_stale_or_wait(lock_path, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(f"[TREE] Timeout waiting for lock on: {path}")
@@ -674,7 +694,8 @@ class PathLockEngine:
             if ancestor_conflict:
                 if await self._is_lock_stale_async(ancestor_conflict, self._lock_expire):
                     logger.warning(f"[TREE] Removing stale ancestor TREE lock: {ancestor_conflict}")
-                    await self._remove_lock_file(ancestor_conflict)
+                    if not await self._reclaim_stale_or_wait(ancestor_conflict, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(
@@ -695,7 +716,8 @@ class PathLockEngine:
             if exact_conflict:
                 if await self._is_lock_stale_async(exact_conflict, self._lock_expire):
                     logger.warning(f"[TREE] Removing stale exact lock: {exact_conflict}")
-                    await self._remove_lock_file(exact_conflict)
+                    if not await self._reclaim_stale_or_wait(exact_conflict, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(f"[TREE] Timeout waiting for exact lock: {exact_conflict}")
@@ -707,7 +729,8 @@ class PathLockEngine:
             if desc_conflict:
                 if await self._is_lock_stale_async(desc_conflict, self._lock_expire):
                     logger.warning(f"[TREE] Removing stale descendant lock: {desc_conflict}")
-                    await self._remove_lock_file(desc_conflict)
+                    if not await self._reclaim_stale_or_wait(desc_conflict, deadline):
+                        return False
                     continue
                 if asyncio.get_running_loop().time() >= deadline:
                     _log_timeout_waiting(
