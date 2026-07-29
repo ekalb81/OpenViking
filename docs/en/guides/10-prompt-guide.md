@@ -127,6 +127,13 @@ Field meanings:
   - The fields included in this memory type
 - `filename_template`
   - The template used to generate the file name
+  - Field values interpolated here are confined to a single path segment: path
+    separators and parent-directory traversal in a model-supplied value are
+    neutralized, so only the separators written in the template itself create
+    directories. A field cannot nest the memory somewhere else — for example, a
+    `tool_name` of `WebFetch / WebSearch` yields one file, not a `WebFetch/`
+    directory. Write the structure you want into the template (as
+    `{{ skill_name }}/SKILL.md` does) rather than expecting a field to supply it.
 - `content_template`
   - The body template used when writing the memory file
 - `embedding_template`

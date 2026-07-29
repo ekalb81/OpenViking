@@ -135,10 +135,17 @@ Create `~/.config/opencode/openviking-config.json`:
 API keys are resolved from environment variables or `~/.openviking/ovcli.conf` and sent as `Authorization: Bearer ...` by both hooks and the MCP proxy. `account` and `user` are trusted-mode identity
 headers sent as `X-OpenViking-Account` and `X-OpenViking-User`; leave them empty
 when using API-key mode with user/admin API keys.
-By default the plugin derives a peer from the project directory using Claude's
-project-directory naming rule: every non-letter-or-digit character becomes `-`,
-with no path normalization. For example, `/Users/x/Dev/OpenViking` becomes
-`-Users-x-Dev-OpenViking`. Data-plane memory/resource requests send the
+By default the plugin derives a peer from the **project root** containing the
+working directory: it walks up to the nearest ancestor holding a project marker
+(`.git`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `pom.xml`,
+`build.gradle`, `.hg`, `.svn`) and names that directory using Claude's
+project-directory rule, where every non-letter-or-digit character becomes `-`.
+For example, a project root of `/Users/x/Dev/OpenViking` becomes
+`-Users-x-Dev-OpenViking`, and a subdirectory of it resolves to the same peer. A
+linked git worktree resolves back to its main repository. Filesystem and drive
+roots, the bare home directory, and the OS temp root are never projects, and a
+working directory with no project above it yields no workspace peer rather than
+one named after the path. Data-plane memory/resource requests send the
 effective peer as `X-OpenViking-Actor-Peer`; captured session messages store it
 as body `peer_id`. Configure `peerId` or `OPENVIKING_PEER_ID` to override the
 workspace-derived peer, or set `workspacePeer=false` /
