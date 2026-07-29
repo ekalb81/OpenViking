@@ -96,6 +96,7 @@ async function fetchJSON(path, init = {}, actorPeerId = undefined) {
     // write. An explicit empty string means "do not claim a peer".
     const actorPeer = actorPeerId === undefined ? activePeerId : actorPeerId;
     if (actorPeer) headers["X-OpenViking-Actor-Peer"] = actorPeer;
+    if (cfg.userAgent) headers["User-Agent"] = cfg.userAgent;
     const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
     const body = await res.json().catch(() => null);
     if (!body) return null;

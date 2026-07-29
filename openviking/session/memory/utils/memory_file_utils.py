@@ -102,6 +102,7 @@ def _serialize_with_metadata(
     content_template: str = None,
     extract_context: Any = None,
     source_uri: Optional[str] = None,
+    render_links: bool = True,
 ) -> str:
     content = metadata.pop("content", "") or ""
 
@@ -127,7 +128,7 @@ def _serialize_with_metadata(
 
     clean_metadata.pop("_uri", None)
     links = clean_metadata.get("links")
-    if isinstance(links, list) and source_uri:
+    if render_links and isinstance(links, list) and source_uri:
         content = LinkRenderer.render_links(content, str(source_uri), links)
 
     _compact_link_arrays(clean_metadata)
@@ -164,6 +165,7 @@ class MemoryFileUtils:
         memory_file: MemoryFile,
         content_template: Optional[str] = None,
         extract_context: Any = None,
+        render_links: bool = True,
     ) -> str:
         """Serialize a MemoryFile as plain-text body plus MEMORY_FIELDS metadata."""
         metadata = memory_file.to_metadata()
@@ -172,6 +174,7 @@ class MemoryFileUtils:
             content_template=content_template,
             extract_context=extract_context,
             source_uri=memory_file.uri,
+            render_links=render_links,
         )
 
     @staticmethod

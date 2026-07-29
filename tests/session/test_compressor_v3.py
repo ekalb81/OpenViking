@@ -92,6 +92,240 @@ def test_factory_ignores_deprecated_memory_version():
     )
 
 
+@pytest.mark.asyncio
+async def test_v3_skips_agent_training_when_agent_evolution_is_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "profile"},
+        agent_evolution_enabled=False,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v3_extracts_session_skills_when_agent_evolution_is_disabled(monkeypatch):
+    config = SimpleNamespace(
+        memory=SimpleNamespace(session_skill_extraction_enabled=True),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(
+        vikingdb=None,
+        skill_processor=SimpleNamespace(),
+    )
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor.extract_session_skills = AsyncMock(
+        return_value={
+            "case_count": 0,
+            "submitted": 0,
+            "skill_submitted": 1,
+            "skill_uris": ["viking://user/u/skills/code-review/SKILL.md"],
+        }
+    )
+    compressor._write_final_memory_diff = AsyncMock()
+
+    result = await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"profile", "preferences"},
+        agent_evolution_enabled=False,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+    compressor.extract_session_skills.assert_awaited_once()
+    assert result["session_skills"] == [
+        {
+            "uri": "viking://user/u/skills/code-review/SKILL.md",
+            "archive_uri": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v3_skill_only_extraction_submits_gradients_without_agent_memories(monkeypatch):
+    from openviking.session.train import PatchSemanticGradient
+
+    skill_uri = "viking://user/u/skills/code-review/SKILL.md"
+    gradient = PatchSemanticGradient(
+        before_file=None,
+        after_file=MemoryFile(
+            uri=skill_uri,
+            content="## Workflow\n- Read changed files first.",
+            memory_type="skills",
+            extra_fields={"skill_name": "code-review"},
+        ),
+        base_version=None,
+        rationale="test",
+        links=[],
+        confidence=0.9,
+        metadata={},
+    )
+    analyzer = SimpleNamespace(
+        extract_trajectory_memories=AsyncMock(
+            return_value={"contexts": [], "skill_gradients": [gradient]}
+        )
+    )
+    trainer = SimpleNamespace(
+        submit_gradients=AsyncMock(
+            return_value=SimpleNamespace(apply_result=SimpleNamespace(written_uris=[skill_uri]))
+        )
+    )
+    compressor = SessionCompressorV3(
+        vikingdb=None,
+        rollout_analyzer=analyzer,
+        skill_processor=SimpleNamespace(),
+    )
+    compressor._session_skill_extraction_enabled = lambda: True
+    compressor._get_session_skill_trainer = AsyncMock(return_value=trainer)
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+
+    result = await compressor.extract_session_skills(
+        messages=_messages(),
+        ctx=_ctx(),
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+    )
+
+    analyzer.extract_trajectory_memories.assert_awaited_once()
+    assert analyzer.extract_trajectory_memories.await_args.kwargs["include_trajectories"] is False
+    trainer.submit_gradients.assert_awaited_once_with([gradient])
+    assert result == {
+        "case_count": 0,
+        "submitted": 0,
+        "skill_submitted": 1,
+        "skill_uris": [skill_uri],
+    }
+
+
+@pytest.mark.asyncio
+async def test_v3_skips_agent_training_when_execution_memory_types_are_filtered(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "profile"},
+        agent_evolution_enabled=True,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v3_passes_allowed_execution_types_to_agent_training(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock(
+        return_value={"case_count": 1, "submitted": 1}
+    )
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "trajectories"},
+        agent_evolution_enabled=True,
+    )
+
+    assert compressor.train_from_extracted_cases.await_args.kwargs["allowed_memory_types"] == {
+        "trajectories"
+    }
+
+
+@pytest.mark.asyncio
+async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
+    initialized_with = []
+
+    class DummyRegistry:
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx
+            initialized_with.append(allowed_memory_types)
+
+    class DummyOrchestrator:
+        async def run(self):
+            return None, []
+
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._get_or_create_react = lambda **kwargs: DummyOrchestrator()
+    compressor._write_final_memory_diff = AsyncMock()
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.create_default_registry",
+        lambda: DummyRegistry(),
+    )
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"profile"},
+        agent_evolution_enabled=False,
+    )
+
+    assert initialized_with == [{"profile"}]
+
+
 def test_experience_root_uri_requires_request_user():
     with pytest.raises(ValueError, match="RequestContext.user.user_id is required"):
         _experience_root_uri(SimpleNamespace(user=None))
@@ -178,274 +412,6 @@ def test_case_experience_links_exclude_experiences_that_failed_to_persist():
         )
         == []
     )
-
-
-@pytest.mark.parametrize(
-    ("errors", "mark_written"),
-    [
-        ([], False),
-        (["experience update rejected"], False),
-        (["link publication failed"], True),
-    ],
-)
-def test_case_training_links_exclude_unapplied_planned_experience(errors, mark_written):
-    """Same guarantee as above, but through the public entry point.
-
-    _case_training_links merges trajectory links with experience links; this
-    pins that a planned-but-unapplied experience never reaches the merged
-    result, whichever way the apply failed.
-    """
-    case_uri = "viking://user/u/memories/cases/case.md"
-    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
-    exp_uri = "viking://user/u/memories/experiences/experience.md"
-    analysis = RolloutAnalysis(
-        evaluation=RubricEvaluation(
-            passed=False,
-            score=0.0,
-            criterion_results=[],
-            feedback=[],
-        ),
-        trajectories=[
-            Trajectory(
-                name="trajectory",
-                uri=traj_uri,
-                content="trajectory content",
-                outcome="failure",
-                retrieval_anchor="",
-            )
-        ],
-    )
-    plan = PolicyUpdatePlan(
-        items=[
-            PolicyPlanItem(
-                kind="upsert",
-                memory_type="experiences",
-                target_name="experience",
-                target_uri=exp_uri,
-                before_content=None,
-                after_content="planned experience content",
-                links=[
-                    StoredLink(
-                        from_uri=exp_uri,
-                        to_uri=traj_uri,
-                        link_type="derived_from",
-                        weight=1.0,
-                    )
-                ],
-            )
-        ]
-    )
-    apply_result = PolicyApplyResult(
-        updated_policy_set=ExperienceSet(
-            root_uri="viking://user/u/memories/experiences",
-            policies=[],
-        ),
-        written_uris=[exp_uri] if mark_written else [],
-        errors=errors,
-    )
-
-    links = _case_training_links(
-        analysis=analysis,
-        case_uri=case_uri,
-        plan=plan,
-        apply_result=apply_result,
-    )
-
-    assert [(link.to_uri, link.link_type) for link in links] == [
-        (traj_uri, "related_to")
-    ]
-
-
-
-@pytest.mark.asyncio
-async def test_case_training_link_target_write_failure_rolls_back_every_endpoint():
-    case_uri = "viking://user/u/memories/cases/case.md"
-    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
-    case_original = MemoryFileUtils.write(
-        MemoryFile(
-            uri=case_uri,
-            content="# case",
-            memory_type="cases",
-            extra_fields={
-                "memory_type": "cases",
-                "case_name": "case",
-                "task_signature": "Complete one bounded task.",
-                "input": '{"summary":"bounded task","preconditions":[]}',
-                "rubric": (
-                    '{"name":"case","description":"complete the task",'
-                    '"criteria":[{"name":"complete","description":"task completed",'
-                    '"required":true,"weight":1.0}]}'
-                ),
-                "evidence": "The rollout contains an observable result.",
-            },
-        )
-    )
-    trajectory_original = MemoryFileUtils.write(
-        MemoryFile(
-            uri=traj_uri,
-            content="trajectory content",
-            memory_type="trajectories",
-            extra_fields={
-                "memory_type": "trajectories",
-                "trajectory_name": "trajectory",
-            },
-        )
-    )
-
-    class FailTargetWriteOnceFS:
-        def __init__(self):
-            self.files = {
-                case_uri: case_original,
-                traj_uri: trajectory_original,
-            }
-            self.write_attempts = []
-            self.target_write_failed = False
-
-        async def read_file(self, uri, ctx=None):
-            del ctx
-            return self.files[uri]
-
-        async def write_file(self, uri, content, ctx=None):
-            del ctx
-            self.write_attempts.append(uri)
-            if uri == traj_uri and not self.target_write_failed:
-                self.target_write_failed = True
-                raise OSError("injected trajectory backlink write failure")
-            self.files[uri] = content
-
-    analysis = RolloutAnalysis(
-        evaluation=RubricEvaluation(
-            passed=True,
-            score=1.0,
-            criterion_results=[],
-            feedback=[],
-        ),
-        trajectories=[
-            Trajectory(
-                name="trajectory",
-                uri=traj_uri,
-                content="trajectory content",
-                outcome="success",
-                retrieval_anchor="",
-            )
-        ],
-    )
-    apply_result = PolicyApplyResult(
-        updated_policy_set=ExperienceSet(
-            root_uri="viking://user/u/memories/experiences",
-            policies=[],
-        ),
-    )
-    fs = FailTargetWriteOnceFS()
-    compressor = object.__new__(SessionCompressorV3)
-
-    with pytest.raises(RuntimeError, match="Failed to write link endpoint"):
-        await compressor._link_case_to_training_outputs(
-            analysis=analysis,
-            case_uri=case_uri,
-            plan=PolicyUpdatePlan(items=[]),
-            apply_result=apply_result,
-            ctx=_ctx(),
-            viking_fs=fs,
-        )
-
-    assert fs.files == {
-        case_uri: case_original,
-        traj_uri: trajectory_original,
-    }
-    assert fs.write_attempts == [case_uri, traj_uri, traj_uri, case_uri]
-
-
-@pytest.mark.asyncio
-async def test_case_training_link_silent_case_write_never_publishes_target_backlink():
-    case_uri = "viking://user/u/memories/cases/case.md"
-    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
-    case_original = MemoryFileUtils.write(
-        MemoryFile(
-            uri=case_uri,
-            content="# case",
-            memory_type="cases",
-            extra_fields={
-                "memory_type": "cases",
-                "case_name": "case",
-                "task_signature": "Complete one bounded task.",
-                "input": '{"summary":"bounded task","preconditions":[]}',
-                "rubric": (
-                    '{"name":"case","description":"complete the task",'
-                    '"criteria":[{"name":"complete","description":"task completed",'
-                    '"required":true,"weight":1.0}]}'
-                ),
-                "evidence": "The rollout contains an observable result.",
-            },
-        )
-    )
-    trajectory_original = MemoryFileUtils.write(
-        MemoryFile(
-            uri=traj_uri,
-            content="trajectory content",
-            memory_type="trajectories",
-            extra_fields={
-                "memory_type": "trajectories",
-                "trajectory_name": "trajectory",
-            },
-        )
-    )
-
-    class IgnoreFirstCaseWriteFS:
-        def __init__(self):
-            self.files = {case_uri: case_original, traj_uri: trajectory_original}
-            self.write_attempts = []
-            self.ignored = False
-
-        async def read_file(self, uri, ctx=None):
-            del ctx
-            return self.files[uri]
-
-        async def write_file(self, uri, content, ctx=None):
-            del ctx
-            self.write_attempts.append(uri)
-            if uri == case_uri and not self.ignored:
-                self.ignored = True
-                return
-            self.files[uri] = content
-
-    analysis = RolloutAnalysis(
-        evaluation=RubricEvaluation(
-            passed=True,
-            score=1.0,
-            criterion_results=[],
-            feedback=[],
-        ),
-        trajectories=[
-            Trajectory(
-                name="trajectory",
-                uri=traj_uri,
-                content="trajectory content",
-                outcome="success",
-                retrieval_anchor="",
-            )
-        ],
-    )
-    fs = IgnoreFirstCaseWriteFS()
-    compressor = object.__new__(SessionCompressorV3)
-
-    with pytest.raises(RuntimeError, match="Case endpoint readback did not match"):
-        await compressor._link_case_to_training_outputs(
-            analysis=analysis,
-            case_uri=case_uri,
-            plan=PolicyUpdatePlan(items=[]),
-            apply_result=PolicyApplyResult(
-                updated_policy_set=ExperienceSet(
-                    root_uri="viking://user/u/memories/experiences",
-                    policies=[],
-                ),
-            ),
-            ctx=_ctx(),
-            viking_fs=fs,
-        )
-
-    assert fs.files == {case_uri: case_original, traj_uri: trajectory_original}
-    assert fs.write_attempts == [case_uri, case_uri]
 
 
 @pytest.mark.asyncio
@@ -557,28 +523,8 @@ async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_failed_experience_apply_is_not_committed_summarized_or_counted(monkeypatch):
-    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
-    traj_uri = "viking://user/u/memories/trajectories/t1.md"
-    exp_uri = "viking://user/u/memories/experiences/e1.md"
-    submitted_gradients = []
-
-    class FakeFS:
-        def __init__(self):
-            self.commits = []
-            self.read_uris = []
-
-        async def ls(self, uri, output="original", ctx=None):
-            del uri, output, ctx
-            return []
-
-        async def read_file(self, uri, ctx=None):
-            del ctx
-            self.read_uris.append(uri)
-            raise AssertionError(f"failed apply URI must not be read for summary: {uri}")
-
-        async def commit(self, **kwargs):
-            self.commits.append(kwargs)
+async def test_train_from_extracted_cases_skips_experience_updates_when_not_allowed(monkeypatch):
+    analyzed = []
 
     class FakeTrainer:
         policy_set = ExperienceSet(
@@ -586,44 +532,10 @@ async def test_failed_experience_apply_is_not_committed_summarized_or_counted(mo
             policies=[],
         )
 
-        async def submit_gradients(self, gradients, *, analysis=None, rollout=None):
-            del rollout
-            submitted_gradients.append(list(gradients))
-            plan = PolicyUpdatePlan(
-                items=[
-                    PolicyPlanItem(
-                        kind="upsert",
-                        memory_type="experiences",
-                        target_name="e1",
-                        target_uri=exp_uri,
-                        before_content=None,
-                        after_content="new experience",
-                        links=[
-                            StoredLink(
-                                from_uri=exp_uri,
-                                to_uri=traj_uri,
-                                link_type="derived_from",
-                                weight=1.0,
-                            )
-                        ],
-                    )
-                ]
-            )
-            return RolloutTrainingResult(
-                analyses=[analysis] if analysis else [],
-                gradients=list(gradients),
-                plan=plan,
-                apply_result=PolicyApplyResult(
-                    updated_policy_set=self.policy_set,
-                    written_uris=[exp_uri],
-                    errors=["injected relation publication failure"],
-                ),
-                metadata={},
-            )
-
     class FakeAnalyzer:
         async def analyze(self, rollout, context):
-            del rollout, context
+            del context
+            analyzed.append(rollout)
             return RolloutAnalysis(
                 evaluation=RubricEvaluation(
                     passed=True,
@@ -634,7 +546,7 @@ async def test_failed_experience_apply_is_not_committed_summarized_or_counted(mo
                 trajectories=[
                     Trajectory(
                         name="duplicate_booking",
-                        uri=traj_uri,
+                        uri="viking://user/u/memories/trajectories/t1.md",
                         content="trajectory content",
                         outcome="success",
                         retrieval_anchor="",
@@ -643,60 +555,32 @@ async def test_failed_experience_apply_is_not_committed_summarized_or_counted(mo
                 gradients=[],
             )
 
-    async def fake_estimate_exp_gradients(self, *args, **kwargs):
-        from openviking.session.train import PatchSemanticGradient
-
-        return [
-            PatchSemanticGradient(
-                before_file=None,
-                after_file=MemoryFile(
-                    uri=exp_uri,
-                    content="new experience",
-                    memory_type="experiences",
-                    extra_fields={"experience_name": "e1"},
-                ),
-                base_version=None,
-                rationale="test",
-                links=[],
-                confidence=0.9,
-                metadata={},
-            )
-        ]
-
-    fs = FakeFS()
-    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
+    estimate = AsyncMock(side_effect=AssertionError("experience estimation must be skipped"))
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(ls=AsyncMock(return_value=[])),
+    )
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_streaming_policy_trainer",
         AsyncMock(return_value=FakeTrainer()),
     )
     monkeypatch.setattr(
         "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
-        fake_estimate_exp_gradients,
+        estimate,
     )
 
-    result = await SessionCompressorV3(
-        vikingdb=None,
-        rollout_analyzer=FakeAnalyzer(),
-    ).train_from_extracted_cases(
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=FakeAnalyzer())
+    result = await compressor.train_from_extracted_cases(
         cases=[_training_case()],
         messages=_messages(),
         ctx=_ctx(),
         session_id="s1",
-        archive_uri=archive_uri,
-        collect_memory_diff=True,
+        allowed_memory_types={"trajectories"},
     )
 
-    assert submitted_gradients
-    assert result["submitted"] == 0
-    assert fs.commits == []
-    assert fs.read_uris == []
-    assert result["memory_diff"]["operations"]["adds"] == [
-        {
-            "uri": traj_uri,
-            "memory_type": "trajectories",
-            "after": "trajectory content",
-        }
-    ]
+    assert len(analyzed) == 1
+    assert result["submitted"] == 1
+    estimate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -783,7 +667,8 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     trained_cases = []
 
     class DummyRegistry:
-        async def initialize_memory_files(self, ctx):
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx, allowed_memory_types
             return None
 
     class DummyOrchestrator:
@@ -829,7 +714,7 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile"},
+        allowed_memory_types={"cases", "profile", "trajectories", "experiences"},
     )
 
     assert len(applied_operations) == 1
@@ -866,7 +751,8 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
         )
 
     class DummyRegistry:
-        async def initialize_memory_files(self, ctx):
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx, allowed_memory_types
             return None
 
     class DummyOrchestrator:
@@ -936,7 +822,7 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile"},
+        allowed_memory_types={"cases", "profile", "trajectories", "experiences"},
     )
 
     assert [context.uri for context in contexts] == [canonical_uri]
@@ -1006,6 +892,7 @@ async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_
     compressor._extract_user_memories = fail_extract_user_memories
     compressor._write_training_case_memory = fake_write_training_case_memory
     compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+    compressor._write_final_memory_diff = AsyncMock()
 
     contexts = await compressor.extract_long_term_memories(
         messages=[case_spec, *rollout_messages],
@@ -1019,6 +906,36 @@ async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_
     assert [case.name for case in trained[0]["cases"]] == ["duplicate_booking"]
     assert trained[0]["messages"] == rollout_messages
     assert contexts[0].uri == "viking://user/u/memories/cases/duplicate_booking.md"
+
+
+@pytest.mark.asyncio
+async def test_v3_training_case_spec_does_not_write_case_when_evolution_disabled():
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[],
+            memory_diff=None,
+            case_uri_by_name={},
+        )
+    )
+    compressor._write_training_case_memory = AsyncMock()
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    contexts = await compressor.extract_long_term_memories(
+        messages=[_case_spec_message(), *_messages()],
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+        allowed_memory_types={"cases", "trajectories", "experiences"},
+        agent_evolution_enabled=False,
+    )
+
+    assert contexts == []
+    compressor._write_training_case_memory.assert_not_awaited()
+    compressor.train_from_extracted_cases.assert_not_awaited()
+    assert compressor._extract_user_memories.await_args.kwargs["allowed_memory_types"] == set()
 
 
 @pytest.mark.asyncio
@@ -1048,7 +965,7 @@ async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy(
 
     assert contexts == []
     assert extracted is True
-    assert trained and trained[0]["messages"][0].id == "case-spec"
+    assert trained == []
 
 
 @pytest.mark.asyncio
@@ -1377,19 +1294,6 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
     traj_uri = "viking://user/u/memories/trajectories/duplicate_booking.md"
     exp_uri = "viking://user/u/memories/experiences/booking_duplicate_handling.md"
     deleted_exp_uri = "viking://user/u/memories/experiences/legacy_booking_handling.md"
-    old_exp_content = """## Situation
-- A duplicate booking must be handled without canceling the wrong reservation.
-
-## Approach
-- Inspect the confirmed booking identifiers before taking action.
-
-## Reflect
-- NEVER infer which booking is the duplicate without verification.
-"""
-    new_exp_content = old_exp_content.replace(
-        "Inspect the confirmed booking identifiers",
-        "Verify the confirmed booking identifiers",
-    )
 
     class FakeFS:
         def __init__(self):
@@ -1437,7 +1341,15 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                 exp_uri: MemoryFileUtils.write(
                     MemoryFile(
                         uri=exp_uri,
-                        content=new_exp_content,
+                        # Link publication reads this endpoint and rejects a
+                        # non-conforming experience as legacy-invalid and
+                        # read-only, so the seeded body must satisfy
+                        # validate_stored_experience.
+                        content=(
+                            "## Situation\n- A duplicate booking arrives for one traveller.\n\n"
+                            "## Approach\n- Keep the valid order and cancel the duplicate.\n\n"
+                            "## Reflect\n- NEVER cancel both orders."
+                        ),
                         memory_type="experiences",
                         extra_fields={
                             "memory_type": "experiences",
@@ -1474,8 +1386,8 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                         memory_type="experiences",
                         target_name="booking_duplicate_handling",
                         target_uri=exp_uri,
-                        before_content=old_exp_content,
-                        after_content=new_exp_content,
+                        before_content="old exp content",
+                        after_content="new exp content",
                         links=[
                             StoredLink(
                                 from_uri=exp_uri,
@@ -1532,7 +1444,7 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                 before_file=None,
                 after_file=MemoryFile(
                     uri=exp_uri,
-                    content=new_exp_content,
+                    content="new exp content",
                     memory_type="experiences",
                     extra_fields={"experience_name": "booking_duplicate_handling"},
                 ),
@@ -1571,14 +1483,18 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
         link["to_uri"] == traj_uri
         and link["link_type"] == "related_to"
         and link.get("match_text") is None
-        and link.get("description") == ""
+        # Empty description is omitted from the stored trailer, so absent and
+        # "" are the same thing here.
+        and (link.get("description") or "") == ""
         for link in case_file.links
     )
     assert any(
         link["to_uri"] == exp_uri
         and link["link_type"] == "related_to"
         and link.get("match_text") is None
-        and link.get("description") == ""
+        # Empty description is omitted from the stored trailer, so absent and
+        # "" are the same thing here.
+        and (link.get("description") or "") == ""
         for link in case_file.links
     )
     linked_experiences_section = (
@@ -1598,5 +1514,415 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
             "message": "Update experience memories from session commit archive_001",
             "paths": [exp_uri, deleted_exp_uri],
             "ctx": _ctx(),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("errors", "mark_written"),
+    [
+        ([], False),
+        (["experience update rejected"], False),
+        (["link publication failed"], True),
+    ],
+)
+def test_case_training_links_exclude_unapplied_planned_experience(errors, mark_written):
+    """Same guarantee as above, but through the public entry point.
+
+    _case_training_links merges trajectory links with experience links; this
+    pins that a planned-but-unapplied experience never reaches the merged
+    result, whichever way the apply failed.
+    """
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    exp_uri = "viking://user/u/memories/experiences/experience.md"
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=False,
+            score=0.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="failure",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="experience",
+                target_uri=exp_uri,
+                before_content=None,
+                after_content="planned experience content",
+                links=[
+                    StoredLink(
+                        from_uri=exp_uri,
+                        to_uri=traj_uri,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            )
+        ]
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+        written_uris=[exp_uri] if mark_written else [],
+        errors=errors,
+    )
+
+    links = _case_training_links(
+        analysis=analysis,
+        case_uri=case_uri,
+        plan=plan,
+        apply_result=apply_result,
+    )
+
+    assert [(link.to_uri, link.link_type) for link in links] == [
+        (traj_uri, "related_to")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_case_training_link_target_write_failure_rolls_back_every_endpoint():
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    case_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=case_uri,
+            content="# case",
+            memory_type="cases",
+            extra_fields={
+                "memory_type": "cases",
+                "case_name": "case",
+                "task_signature": "Complete one bounded task.",
+                "input": '{"summary":"bounded task","preconditions":[]}',
+                "rubric": (
+                    '{"name":"case","description":"complete the task",'
+                    '"criteria":[{"name":"complete","description":"task completed",'
+                    '"required":true,"weight":1.0}]}'
+                ),
+                "evidence": "The rollout contains an observable result.",
+            },
+        )
+    )
+    trajectory_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=traj_uri,
+            content="trajectory content",
+            memory_type="trajectories",
+            extra_fields={
+                "memory_type": "trajectories",
+                "trajectory_name": "trajectory",
+            },
+        )
+    )
+
+    class FailTargetWriteOnceFS:
+        def __init__(self):
+            self.files = {
+                case_uri: case_original,
+                traj_uri: trajectory_original,
+            }
+            self.write_attempts = []
+            self.target_write_failed = False
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None):
+            del ctx
+            self.write_attempts.append(uri)
+            if uri == traj_uri and not self.target_write_failed:
+                self.target_write_failed = True
+                raise OSError("injected trajectory backlink write failure")
+            self.files[uri] = content
+
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=True,
+            score=1.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="success",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+    )
+    fs = FailTargetWriteOnceFS()
+    compressor = object.__new__(SessionCompressorV3)
+
+    with pytest.raises(RuntimeError, match="Failed to write link endpoint"):
+        await compressor._link_case_to_training_outputs(
+            analysis=analysis,
+            case_uri=case_uri,
+            plan=PolicyUpdatePlan(items=[]),
+            apply_result=apply_result,
+            ctx=_ctx(),
+            viking_fs=fs,
+        )
+
+    assert fs.files == {
+        case_uri: case_original,
+        traj_uri: trajectory_original,
+    }
+    assert fs.write_attempts == [case_uri, traj_uri, traj_uri, case_uri]
+
+
+@pytest.mark.asyncio
+async def test_case_training_link_silent_case_write_never_publishes_target_backlink():
+    case_uri = "viking://user/u/memories/cases/case.md"
+    traj_uri = "viking://user/u/memories/trajectories/trajectory.md"
+    case_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=case_uri,
+            content="# case",
+            memory_type="cases",
+            extra_fields={
+                "memory_type": "cases",
+                "case_name": "case",
+                "task_signature": "Complete one bounded task.",
+                "input": '{"summary":"bounded task","preconditions":[]}',
+                "rubric": (
+                    '{"name":"case","description":"complete the task",'
+                    '"criteria":[{"name":"complete","description":"task completed",'
+                    '"required":true,"weight":1.0}]}'
+                ),
+                "evidence": "The rollout contains an observable result.",
+            },
+        )
+    )
+    trajectory_original = MemoryFileUtils.write(
+        MemoryFile(
+            uri=traj_uri,
+            content="trajectory content",
+            memory_type="trajectories",
+            extra_fields={
+                "memory_type": "trajectories",
+                "trajectory_name": "trajectory",
+            },
+        )
+    )
+
+    class IgnoreFirstCaseWriteFS:
+        def __init__(self):
+            self.files = {case_uri: case_original, traj_uri: trajectory_original}
+            self.write_attempts = []
+            self.ignored = False
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None):
+            del ctx
+            self.write_attempts.append(uri)
+            if uri == case_uri and not self.ignored:
+                self.ignored = True
+                return
+            self.files[uri] = content
+
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=True,
+            score=1.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="trajectory",
+                uri=traj_uri,
+                content="trajectory content",
+                outcome="success",
+                retrieval_anchor="",
+            )
+        ],
+    )
+    fs = IgnoreFirstCaseWriteFS()
+    compressor = object.__new__(SessionCompressorV3)
+
+    with pytest.raises(RuntimeError, match="Case endpoint readback did not match"):
+        await compressor._link_case_to_training_outputs(
+            analysis=analysis,
+            case_uri=case_uri,
+            plan=PolicyUpdatePlan(items=[]),
+            apply_result=PolicyApplyResult(
+                updated_policy_set=ExperienceSet(
+                    root_uri="viking://user/u/memories/experiences",
+                    policies=[],
+                ),
+            ),
+            ctx=_ctx(),
+            viking_fs=fs,
+        )
+
+    assert fs.files == {case_uri: case_original, traj_uri: trajectory_original}
+    assert fs.write_attempts == [case_uri, case_uri]
+
+
+@pytest.mark.asyncio
+async def test_failed_experience_apply_is_not_committed_summarized_or_counted(monkeypatch):
+    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
+    traj_uri = "viking://user/u/memories/trajectories/t1.md"
+    exp_uri = "viking://user/u/memories/experiences/e1.md"
+    submitted_gradients = []
+
+    class FakeFS:
+        def __init__(self):
+            self.commits = []
+            self.read_uris = []
+
+        async def ls(self, uri, output="original", ctx=None):
+            del uri, output, ctx
+            return []
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            self.read_uris.append(uri)
+            raise AssertionError(f"failed apply URI must not be read for summary: {uri}")
+
+        async def commit(self, **kwargs):
+            self.commits.append(kwargs)
+
+    class FakeTrainer:
+        policy_set = ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        )
+
+        async def submit_gradients(self, gradients, *, analysis=None, rollout=None):
+            del rollout
+            submitted_gradients.append(list(gradients))
+            plan = PolicyUpdatePlan(
+                items=[
+                    PolicyPlanItem(
+                        kind="upsert",
+                        memory_type="experiences",
+                        target_name="e1",
+                        target_uri=exp_uri,
+                        before_content=None,
+                        after_content="new experience",
+                        links=[
+                            StoredLink(
+                                from_uri=exp_uri,
+                                to_uri=traj_uri,
+                                link_type="derived_from",
+                                weight=1.0,
+                            )
+                        ],
+                    )
+                ]
+            )
+            return RolloutTrainingResult(
+                analyses=[analysis] if analysis else [],
+                gradients=list(gradients),
+                plan=plan,
+                apply_result=PolicyApplyResult(
+                    updated_policy_set=self.policy_set,
+                    written_uris=[exp_uri],
+                    errors=["injected relation publication failure"],
+                ),
+                metadata={},
+            )
+
+    class FakeAnalyzer:
+        async def analyze(self, rollout, context):
+            del rollout, context
+            return RolloutAnalysis(
+                evaluation=RubricEvaluation(
+                    passed=True,
+                    score=1.0,
+                    criterion_results=[],
+                    feedback=[],
+                ),
+                trajectories=[
+                    Trajectory(
+                        name="duplicate_booking",
+                        uri=traj_uri,
+                        content="trajectory content",
+                        outcome="success",
+                        retrieval_anchor="",
+                    )
+                ],
+                gradients=[],
+            )
+
+    async def fake_estimate_exp_gradients(self, *args, **kwargs):
+        from openviking.session.train import PatchSemanticGradient
+
+        return [
+            PatchSemanticGradient(
+                before_file=None,
+                after_file=MemoryFile(
+                    uri=exp_uri,
+                    content="new experience",
+                    memory_type="experiences",
+                    extra_fields={"experience_name": "e1"},
+                ),
+                base_version=None,
+                rationale="test",
+                links=[],
+                confidence=0.9,
+                metadata={},
+            )
+        ]
+
+    fs = FakeFS()
+    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_streaming_policy_trainer",
+        AsyncMock(return_value=FakeTrainer()),
+    )
+    monkeypatch.setattr(
+        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
+        fake_estimate_exp_gradients,
+    )
+
+    result = await SessionCompressorV3(
+        vikingdb=None,
+        rollout_analyzer=FakeAnalyzer(),
+    ).train_from_extracted_cases(
+        cases=[_training_case()],
+        messages=_messages(),
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri=archive_uri,
+        collect_memory_diff=True,
+    )
+
+    assert submitted_gradients
+    assert result["submitted"] == 0
+    assert fs.commits == []
+    assert fs.read_uris == []
+    assert result["memory_diff"]["operations"]["adds"] == [
+        {
+            "uri": traj_uri,
+            "memory_type": "trajectories",
+            "after": "trajectory content",
         }
     ]

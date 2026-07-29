@@ -28,6 +28,12 @@ from openviking.resource.feishu_watch_auth import (
     create_feishu_auth_state,
     load_feishu_app_credentials,
 )
+from openviking.resource.processing_mode import (
+    DEFAULT_PROCESSING_MODE,
+    VECTORS_ONLY,
+    ProcessingMode,
+    normalize_processing_mode,
+)
 from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import (
     is_remote_resource_source,
@@ -64,6 +70,7 @@ from openviking_cli.exceptions import (
 from openviking_cli.utils import get_logger
 
 if TYPE_CHECKING:
+    from openviking.parse.accessors.base import LocalResource
     from openviking.resource.watch_manager import WatchManager
     from openviking.resource.watch_scheduler import WatchScheduler
     from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
@@ -83,6 +90,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "timeout",
         "build_index",
         "summarize",
+        "processing_mode",
         "watch_interval",
         "skip_watch_management",
         "allow_local_path_resolution",
@@ -101,7 +109,24 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "telemetry",
         "request_validator",
         "understanding_response_id",
+        "parser_backend",
+        "resolved_extension",
         "defer_post_processing",
+    }
+)
+
+_INTERNAL_INGESTION_FIELDS = frozenset(
+    {
+        "manage_watch",
+        "parser_args",
+        "resource_lock",
+        "route_source",
+        "skip_watch_management",
+        "stage_callback",
+        "watch_auth_state",
+        "understanding_response_id",
+        "parser_backend",
+        "resolved_extension",
     }
 )
 
@@ -161,14 +186,6 @@ class ResourceService:
             return None
         return self._watch_scheduler.watch_manager
 
-    def _get_parser_router(self):
-        if not hasattr(self, "_parser_router"):
-            from openviking.parse.parser_router import ParserRouter
-            from openviking.parse.registry import get_registry
-
-            self._parser_router = ParserRouter(get_registry())
-        return self._parser_router
-
     def _sanitize_watch_processor_kwargs(self, processor_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
         for key, value in processor_kwargs.items():
@@ -183,7 +200,7 @@ class ResourceService:
         self,
         *,
         watch_manager: Optional["WatchManager"],
-        skip_watch_management: bool,
+        manage_watch: bool,
         watch_interval: float,
         target: ContentTargetSpec,
         root_uri: str,
@@ -192,11 +209,12 @@ class ResourceService:
         instruction: str,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         processor_kwargs: Dict[str, Any],
         watch_auth_state: Optional[Dict[str, Any]],
         ctx: RequestContext,
     ) -> None:
-        if not watch_manager or skip_watch_management:
+        if not watch_manager or not manage_watch:
             return
         telemetry = get_current_telemetry()
         with telemetry.measure("resource.watch"):
@@ -242,6 +260,7 @@ class ResourceService:
                         watch_interval=watch_interval,
                         build_index=build_index,
                         summarize=summarize,
+                        processing_mode=processing_mode,
                         processor_kwargs=sanitized,
                         auth_state=watch_auth_state,
                         ctx=ctx,
@@ -384,6 +403,15 @@ class ResourceService:
             target_uri = msg.root_uri
             parent_uri = None
             internal_kwargs: Dict[str, Any] = {}
+            queued_args = dict(msg.args)
+            for key in ("parser_backend", "resolved_extension"):
+                if key in queued_args:
+                    internal_kwargs[key] = queued_args.pop(key)
+            normalized_args = self._normalize_add_resource_args(
+                queued_args,
+                watch_interval=msg.watch_interval,
+            )
+            internal_kwargs.update(normalized_args.processor_kwargs)
             if msg.defer_target_resolution:
                 from openviking_cli.utils.uri import VikingURI
 
@@ -393,7 +421,7 @@ class ResourceService:
                 from openviking.parse.understanding_api import PREPARED_RESPONSE_ID_ARG
 
                 internal_kwargs[PREPARED_RESPONSE_ID_ARG] = msg.understanding_response_id
-            return await self.add_resource(
+            return await self._execute_resource_ingestion(
                 path=msg.path,
                 ctx=ctx,
                 to=target_uri,
@@ -404,12 +432,14 @@ class ResourceService:
                 timeout=msg.timeout,
                 build_index=msg.build_index,
                 summarize=msg.summarize,
+                processing_mode=msg.processing_mode,
                 watch_interval=msg.watch_interval,
-                skip_watch_management=msg.skip_watch_management,
+                manage_watch=not msg.skip_watch_management,
                 allow_local_path_resolution=msg.allow_local_path_resolution,
                 enforce_public_remote_targets=msg.enforce_public_remote_targets,
                 resource_lock=resource_lock,
                 stage_callback=stage_callback,
+                watch_auth_state=normalized_args.watch_auth_state,
                 strict=msg.strict,
                 source_name=msg.source_name,
                 ignore_dirs=msg.ignore_dirs,
@@ -418,7 +448,6 @@ class ResourceService:
                 directly_upload_media=msg.directly_upload_media,
                 preserve_structure=msg.preserve_structure,
                 create_parent=msg.create_parent,
-                args=msg.args,
                 **internal_kwargs,
             )
 
@@ -435,6 +464,7 @@ class ResourceService:
                 resource_lock=resource_lock,
                 summarize=msg.summarize,
                 build_index=msg.build_index,
+                processing_mode=msg.processing_mode,
             )
             await request_wait_tracker.wait_for_request(
                 telemetry_id,
@@ -485,8 +515,9 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
-        skip_watch_management: bool = False,
+        manage_watch: bool = True,
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
@@ -494,6 +525,7 @@ class ResourceService:
     ) -> Dict[str, Any]:
         """Start background ingestion for Git repositories while reserving the target URI."""
         self._ensure_initialized()
+        processing_mode = normalize_processing_mode(processing_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         from openviking.connector.routing import CONNECTOR_CREDENTIAL_ARGS
@@ -559,8 +591,9 @@ class ResourceService:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 watch_interval=watch_interval,
-                skip_watch_management=skip_watch_management,
+                skip_watch_management=not manage_watch,
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 strict=bool(kwargs.get("strict", False)),
@@ -629,18 +662,6 @@ class ResourceService:
         )
         return root_uri, resource_lock
 
-    def _should_use_understanding_api(self, path: str) -> bool:
-        return self._get_parser_router().should_use_understanding_api(path)
-
-    @staticmethod
-    def _is_feishu_url(path: str) -> bool:
-        try:
-            from openviking.parse.accessors.feishu_accessor import FeishuAccessor
-
-            return FeishuAccessor._is_feishu_url(path)
-        except Exception:
-            return False
-
     @staticmethod
     def _target_doc_name(
         path: str,
@@ -702,16 +723,99 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
-        skip_watch_management: bool = False,
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
-        resource_lock: Optional[LockLease] = None,
-        stage_callback: Optional[Callable[[str], Any]] = None,
         args: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Add resource to OpenViking (only supports resources scope).
+        """Accept and route a new resource-add request."""
+        internal_fields = sorted(set(kwargs).intersection(_INTERNAL_INGESTION_FIELDS))
+        if internal_fields:
+            raise InvalidArgumentError(
+                "add_resource does not accept internal execution fields: "
+                + ", ".join(internal_fields)
+            )
+        return await self._submit_resource_ingestion(
+            path=path,
+            ctx=ctx,
+            to=to,
+            parent=parent,
+            reason=reason,
+            instruction=instruction,
+            wait=wait,
+            timeout=timeout,
+            build_index=build_index,
+            summarize=summarize,
+            processing_mode=processing_mode,
+            watch_interval=watch_interval,
+            manage_watch=True,
+            allow_local_path_resolution=allow_local_path_resolution,
+            enforce_public_remote_targets=enforce_public_remote_targets,
+            args=args,
+            **kwargs,
+        )
+
+    async def refresh_resource(
+        self,
+        path: str,
+        ctx: RequestContext,
+        to: Optional[str] = None,
+        parent: Optional[str] = None,
+        reason: str = "",
+        instruction: str = "",
+        timeout: Optional[float] = None,
+        build_index: bool = True,
+        summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        watch_interval: float = 0,
+        allow_local_path_resolution: bool = True,
+        enforce_public_remote_targets: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Submit a scheduled refresh without changing its watch task."""
+        return await self._submit_resource_ingestion(
+            path=path,
+            ctx=ctx,
+            to=to,
+            parent=parent,
+            reason=reason,
+            instruction=instruction,
+            wait=False,
+            timeout=timeout,
+            build_index=build_index,
+            summarize=summarize,
+            processing_mode=processing_mode,
+            watch_interval=watch_interval,
+            manage_watch=False,
+            allow_local_path_resolution=allow_local_path_resolution,
+            enforce_public_remote_targets=enforce_public_remote_targets,
+            args=None,
+            **kwargs,
+        )
+
+    async def _submit_resource_ingestion(
+        self,
+        path: str,
+        ctx: RequestContext,
+        to: Optional[str] = None,
+        parent: Optional[str] = None,
+        reason: str = "",
+        instruction: str = "",
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        build_index: bool = True,
+        summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        watch_interval: float = 0,
+        manage_watch: bool = True,
+        allow_local_path_resolution: bool = True,
+        enforce_public_remote_targets: bool = False,
+        args: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Validate and route one resource ingestion request.
 
         Args:
             path: Resource path (local file or URL)
@@ -723,6 +827,7 @@ class ResourceService:
             timeout: Wait timeout in seconds
             build_index: Whether to build vector index immediately (default: True)
             summarize: Whether to generate summary (default: False)
+            processing_mode: Post-ingest processing mode for semantic/vector work
             watch_interval: Watch interval in minutes for automatic resource monitoring.
                 - watch_interval > 0: Creates or updates a watch task. The resource will be
                   automatically re-processed at the specified interval by the scheduler.
@@ -734,8 +839,6 @@ class ResourceService:
                 Note: If the target URI already has an active watch task, a ConflictError will be
                 raised. You must first cancel the existing watch (set watch_interval <= 0) before
                 creating a new one.
-            skip_watch_management: If True, skip watch task management (used by scheduler to
-                avoid recursive watch task creation during scheduled execution)
             enforce_public_remote_targets: When True, reject non-public remote hosts and
                 validate each outbound HTTP request URL during fetch.
             args: Parser/accessor-specific options forwarded to the processing chain.
@@ -749,6 +852,7 @@ class ResourceService:
             InvalidArgumentError: If the URI scope is not 'resources'
         """
         self._ensure_initialized()
+        processing_mode = normalize_processing_mode(processing_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         if watch_interval > 0 and kwargs.get("temp_file_id"):
@@ -784,6 +888,7 @@ class ResourceService:
             instruction=instruction,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             connector_args=args or {},
             kwargs=kwargs,
@@ -808,13 +913,60 @@ class ResourceService:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 watch_interval=watch_interval,
-                skip_watch_management=skip_watch_management,
+                manage_watch=manage_watch,
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 **kwargs,
             )
 
+        return await self._execute_resource_ingestion(
+            path=path,
+            ctx=ctx,
+            to=to,
+            parent=parent,
+            reason=reason,
+            instruction=instruction,
+            wait=wait,
+            timeout=timeout,
+            build_index=build_index,
+            summarize=summarize,
+            processing_mode=processing_mode,
+            watch_interval=watch_interval,
+            manage_watch=manage_watch,
+            allow_local_path_resolution=allow_local_path_resolution,
+            enforce_public_remote_targets=enforce_public_remote_targets,
+            watch_auth_state=normalized_args.watch_auth_state,
+            parser_args=normalized_args.processor_kwargs,
+            **kwargs,
+        )
+
+    async def _execute_resource_ingestion(
+        self,
+        path: str,
+        ctx: RequestContext,
+        to: Optional[str] = None,
+        parent: Optional[str] = None,
+        reason: str = "",
+        instruction: str = "",
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        build_index: bool = True,
+        summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        watch_interval: float = 0,
+        manage_watch: bool = True,
+        allow_local_path_resolution: bool = True,
+        enforce_public_remote_targets: bool = False,
+        watch_auth_state: Optional[Dict[str, Any]] = None,
+        parser_args: Optional[Dict[str, Any]] = None,
+        resource_lock: Optional[LockLease] = None,
+        stage_callback: Optional[Callable[[str], Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Execute an already-routed resource ingestion."""
+        self._ensure_initialized()
         request_start = time.perf_counter()
         telemetry = get_current_telemetry()
         telemetry_id = register_wait_telemetry(wait)
@@ -824,13 +976,14 @@ class ResourceService:
         if telemetry_id:
             request_wait_tracker.register_request(telemetry_id)
         watch_manager = self._get_watch_manager()
-        watch_enabled = bool(watch_manager and not skip_watch_management and watch_interval > 0)
+        watch_enabled = bool(watch_manager and manage_watch and watch_interval > 0)
 
         telemetry.set("resource.flags.wait", wait)
         telemetry.set("resource.flags.build_index", build_index)
         telemetry.set("resource.flags.summarize", summarize)
         telemetry.set("resource.flags.watch_enabled", watch_enabled)
 
+        prepared_resource: Optional["LocalResource"] = None
         try:
             target = ContentTargetSpec.from_fields(
                 ctx=ctx,
@@ -845,20 +998,57 @@ class ResourceService:
             if resource_lock is not None:
                 kwargs["resource_lock"] = resource_lock
 
-            if (
+            async_understanding_candidate = (
                 not wait
                 and not is_git_repo_url(path)
-                and self._should_use_understanding_api(path)
                 and not allow_local_path_resolution
                 and self._resource_processor is not None
+            )
+            direct_understanding = bool(
+                async_understanding_candidate
+                and self._resource_processor.should_use_understanding_directly(path, **kwargs)
+            )
+
+            if (
+                async_understanding_candidate
+                and not direct_understanding
+                and self._resource_processor.understanding_api_enabled()
             ):
+                prepared_resource = await self._resource_processor.prepare_resource(
+                    path,
+                    ctx,
+                    allow_local_path_resolution=allow_local_path_resolution,
+                    **kwargs,
+                )
+
+            if (
+                prepared_resource is not None
+                and self._resource_processor is not None
+                and self._resource_processor.should_use_understanding_api(prepared_resource)
+            ):
+                understanding_source = prepared_resource
+            elif direct_understanding:
+                understanding_source = path
+            else:
+                understanding_source = None
+
+            if understanding_source is not None:
                 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 
-                source_name = kwargs.get("source_name")
+                if prepared_resource is not None:
+                    resolved_extension = str(prepared_resource.meta.get("resolved_extension") or "")
+                    source_name = (
+                        kwargs.get("source_name")
+                        or prepared_resource.meta.get("original_filename")
+                        or prepared_resource.meta.get("resolved_name")
+                    )
+                else:
+                    resolved_extension = ""
+                    source_name = kwargs.get("source_name")
                 source_info = _ResourceSourceInfo(
                     source_name=source_name,
                     source_path=path,
-                    source_format="file",
+                    source_format=resolved_extension.lstrip(".") or "file",
                 )
                 doc_name = self._target_doc_name(path, source_name, source_info)
                 source_path = source_info.source_path or source_name or path
@@ -876,10 +1066,7 @@ class ResourceService:
                     create_parent=target.create_parent,
                 )
                 defer_target_resolution = bool(
-                    candidate_uri
-                    and not source_name
-                    and not watch_enabled
-                    and self._is_feishu_url(path)
+                    candidate_uri and not source_name and not watch_enabled and direct_understanding
                 )
                 if self._viking_fs is None:
                     raise NotInitializedError("VikingFS")
@@ -913,14 +1100,20 @@ class ResourceService:
 
                 enqueue_started = False
                 try:
-                    queued_args = dict(normalized_args.processor_kwargs)
-                    feishu_access_token = queued_args.pop(FEISHU_ACCESS_TOKEN_ARG, None)
-                    understanding_response_id = None
-                    if self._is_feishu_url(path) and feishu_access_token:
-                        understanding_response_id = await self._get_parser_router().submit_url(
-                            path,
-                            feishu_access_token=feishu_access_token,
-                        )
+                    queued_args = dict(parser_args or {})
+                    understanding_response_id = await self._resource_processor.submit_understanding(
+                        understanding_source,
+                        **queued_args,
+                    )
+                    queued_args.pop(FEISHU_ACCESS_TOKEN_ARG, None)
+                    if prepared_resource is not None:
+                        prepared_resource.cleanup()
+                        prepared_resource = None
+
+                    processor_args = self._sanitize_watch_processor_kwargs(queued_args)
+                    processor_args["parser_backend"] = "understanding"
+                    if resolved_extension:
+                        processor_args["resolved_extension"] = resolved_extension
 
                     lock_handoff = lock_lease.to_handoff()
                     msg = AddResourceMsg(
@@ -937,6 +1130,7 @@ class ResourceService:
                         timeout=timeout,
                         build_index=build_index,
                         summarize=summarize,
+                        processing_mode=processing_mode,
                         strict=bool(kwargs.get("strict", False)),
                         ignore_dirs=kwargs.get("ignore_dirs"),
                         include=kwargs.get("include"),
@@ -946,7 +1140,7 @@ class ResourceService:
                         create_parent=bool(kwargs.get("create_parent", False)),
                         allow_local_path_resolution=allow_local_path_resolution,
                         enforce_public_remote_targets=enforce_public_remote_targets,
-                        args=self._sanitize_watch_processor_kwargs(queued_args),
+                        args=processor_args,
                         source_name=source_name,
                         lock_handoff=lock_handoff.to_dict() if lock_handoff else None,
                         skip_watch_management=True,
@@ -972,7 +1166,7 @@ class ResourceService:
                 )
                 await self._manage_watch_if_needed(
                     watch_manager=watch_manager,
-                    skip_watch_management=skip_watch_management,
+                    manage_watch=manage_watch,
                     watch_interval=watch_interval,
                     target=target,
                     root_uri=root_uri,
@@ -981,8 +1175,9 @@ class ResourceService:
                     instruction=instruction,
                     build_index=build_index,
                     summarize=summarize,
+                    processing_mode=processing_mode,
                     processor_kwargs=kwargs,
-                    watch_auth_state=normalized_args.watch_auth_state,
+                    watch_auth_state=watch_auth_state,
                     ctx=ctx,
                 )
                 response = {
@@ -1003,11 +1198,14 @@ class ResourceService:
                 parent=target.parent,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 stage_callback=stage_callback,
                 allow_local_path_resolution=allow_local_path_resolution,
+                prepared_resource=prepared_resource,
                 defer_post_processing=not wait,
                 **kwargs,
             )
+            prepared_resource = None
 
             if result.get("status") == "error":
                 return result
@@ -1082,6 +1280,7 @@ class ResourceService:
                     timeout=timeout,
                     build_index=build_index,
                     summarize=summarize,
+                    processing_mode=processing_mode,
                     strict=bool(kwargs.get("strict", False)),
                     ignore_dirs=kwargs.get("ignore_dirs"),
                     include=kwargs.get("include"),
@@ -1104,7 +1303,7 @@ class ResourceService:
                 job_enqueued = True
             await self._manage_watch_if_needed(
                 watch_manager=watch_manager,
-                skip_watch_management=skip_watch_management,
+                manage_watch=manage_watch,
                 watch_interval=watch_interval,
                 target=target,
                 root_uri=str(result.get("root_uri") or ""),
@@ -1113,8 +1312,9 @@ class ResourceService:
                 instruction=instruction,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=kwargs,
-                watch_auth_state=normalized_args.watch_auth_state,
+                watch_auth_state=watch_auth_state,
                 ctx=ctx,
             )
             if wait:
@@ -1134,6 +1334,8 @@ class ResourceService:
             )
             raise
         finally:
+            if prepared_resource is not None:
+                prepared_resource.cleanup()
             telemetry.set(
                 "resource.request.duration_ms",
                 round((time.perf_counter() - request_start) * 1000, 3),
@@ -1222,6 +1424,7 @@ class ResourceService:
         instruction: str = "",
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         connector_args: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
@@ -1307,6 +1510,7 @@ class ResourceService:
             instruction=instruction,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             connector_args=connector_args,
             kwargs=kwargs or {},
@@ -1337,6 +1541,7 @@ class ResourceService:
         instruction: str,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         watch_interval: float,
         connector_args: Dict[str, Any],
         kwargs: Dict[str, Any],
@@ -1369,6 +1574,8 @@ class ResourceService:
             unsupported.append("build_index=false")
         if summarize:
             unsupported.append("summarize=true")
+        if processing_mode == VECTORS_ONLY:
+            unsupported.append("processing_mode=vectors_only")
         if kwargs.get("strict"):
             unsupported.append("strict=true (Connector imports fail per file, not all-or-nothing)")
         for field in ("ignore_dirs", "include", "exclude"):
@@ -1688,6 +1895,7 @@ class ResourceService:
         watch_interval: float,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         processor_kwargs: Dict[str, Any],
         auth_state: Optional[Dict[str, Any]],
         ctx: RequestContext,
@@ -1736,6 +1944,7 @@ class ResourceService:
                 watch_interval=watch_interval,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=processor_kwargs,
                 auth_state=auth_state,
                 is_active=True,
@@ -1756,6 +1965,7 @@ class ResourceService:
                 watch_interval=watch_interval,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=processor_kwargs,
                 auth_state=auth_state,
             )

@@ -967,6 +967,7 @@ class MemoryUpdater:
         viking_fs: Any,
         directory_uri: str,
         ctx: RequestContext,
+        strict: bool = False,
     ) -> None:
         memory_type = cls.memory_type_from_uri(directory_uri)
         if not memory_type:
@@ -983,6 +984,8 @@ class MemoryUpdater:
                 directory_uri,
                 exc_info=True,
             )
+            if strict:
+                raise
 
     @classmethod
     async def refresh_file_embedding(
@@ -993,6 +996,7 @@ class MemoryUpdater:
         uri: str,
         memory_type: Optional[str],
         ctx: RequestContext,
+        strict: bool = False,
     ) -> bool:
         if not vikingdb or not bool(getattr(vikingdb, "has_queue_manager", False)):
             return False
@@ -1011,6 +1015,8 @@ class MemoryUpdater:
             return attempted > 0
         except Exception:
             logger.warning("Failed to refresh memory embedding for %s", uri, exc_info=True)
+            if strict:
+                raise
             return False
 
     @staticmethod

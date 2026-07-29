@@ -7,6 +7,7 @@ from openviking_sdk import AsyncHTTPClient, SyncHTTPClient
 from openviking_sdk.client import Session, SyncSession
 from openviking_sdk.errors import NotFoundError
 
+
 @pytest.mark.asyncio
 async def test_async_http_client_initialize_forwards_event_hooks():
     async def request_hook(_request):
@@ -151,6 +152,19 @@ async def test_async_http_client_reindex_posts_content_reindex():
             "wait": False,
             "dry_run": True,
         },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cleanup", "action"), [(False, "migrate"), (True, "cleanup")])
+async def test_async_http_client_admin_migrate_posts_action_payload(cleanup, action):
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response = lambda _response: {"status": "accepted"}
+
+    assert await client.admin_migrate(cleanup=cleanup) == {"status": "accepted"}
+    client._request.assert_awaited_once_with(
+        "POST", "/api/v1/admin/migrate", json={"action": action}
     )
 
 
@@ -437,6 +451,77 @@ async def test_add_resource_uploads_local_file_even_when_url_is_localhost(tmp_pa
     assert payload["temp_file_id"] == "upload_resource.md"
     assert payload["watch_interval"] == 60
     assert "path" not in payload
+
+
+@pytest.mark.asyncio
+async def test_add_resource_forwards_processing_mode():
+    client = AsyncHTTPClient(url="http://127.0.0.1:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response_data = lambda _response: {
+        "result": {"root_uri": "viking://resources/demo"}
+    }
+
+    await client.add_resource(
+        "https://example.com/demo.md",
+        processing_mode="vectors_only",
+    )
+
+    fake_http.post.assert_awaited_once()
+    payload = fake_http.post.await_args.kwargs["json"]
+    assert payload["processing_mode"] == "vectors_only"
+
+
+@pytest.mark.asyncio
+async def test_add_resource_omits_default_processing_mode_for_legacy_servers():
+    client = AsyncHTTPClient(url="http://127.0.0.1:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response_data = lambda _response: {
+        "result": {"root_uri": "viking://resources/demo"}
+    }
+
+    await client.add_resource("https://example.com/demo.md")
+
+    fake_http.post.assert_awaited_once()
+    payload = fake_http.post.await_args.kwargs["json"]
+    assert "processing_mode" not in payload
+
+
+@pytest.mark.asyncio
+async def test_add_resource_preserves_positional_watch_args_for_legacy_callers():
+    client = AsyncHTTPClient(url="http://127.0.0.1:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response_data = lambda _response: {
+        "result": {"root_uri": "viking://resources/demo"}
+    }
+
+    await client.add_resource(
+        "https://example.com/demo.md",
+        None,
+        None,
+        "",
+        "",
+        False,
+        None,
+        False,
+        None,
+        None,
+        None,
+        True,
+        None,
+        1440,
+        {"site": True},
+        False,
+    )
+
+    fake_http.post.assert_awaited_once()
+    payload = fake_http.post.await_args.kwargs["json"]
+    assert payload["watch_interval"] == 1440
+    assert payload["args"] == {"site": True}
+    assert payload["telemetry"] is False
+    assert "processing_mode" not in payload
 
 
 @pytest.mark.asyncio

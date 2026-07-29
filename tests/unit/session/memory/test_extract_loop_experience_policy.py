@@ -142,7 +142,11 @@ async def test_existing_experience_page_id_mismatch_stops_run_before_repair():
         ) as mock_create_model,
     ):
         mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-        mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+        mock_create_model.return_value = SimpleNamespace(
+            model_json_schema=lambda: {},
+            # Upstream derives the stability parser allowlist from model_fields.
+            model_fields={"experiences": None, "links": None, "delete_ids": None},
+        )
 
         operations, _ = await loop.run()
 
@@ -290,7 +294,11 @@ async def test_invalid_experience_gets_one_repair_iteration_before_acceptance():
         ) as mock_create_model,
     ):
         mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-        mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+        mock_create_model.return_value = SimpleNamespace(
+            model_json_schema=lambda: {},
+            # Upstream derives the stability parser allowlist from model_fields.
+            model_fields={"experiences": None, "links": None, "delete_ids": None},
+        )
 
         operations, _ = await loop.run()
 
@@ -391,7 +399,11 @@ async def test_experience_repair_fails_closed_when_valid_sibling_is_dropped():
         ) as mock_create_model,
     ):
         mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-        mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+        mock_create_model.return_value = SimpleNamespace(
+            model_json_schema=lambda: {},
+            # Upstream derives the stability parser allowlist from model_fields.
+            model_fields={"experiences": None, "links": None, "delete_ids": None},
+        )
 
         operations, _ = await loop.run()
 
