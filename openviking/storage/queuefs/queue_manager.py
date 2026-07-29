@@ -74,6 +74,9 @@ class QueueManager:
     ADD_RESOURCE = "AddResource"
     SESSION_COMMIT = "SessionCommit"
 
+    # Throttle interval for repeated size-read failure logs (seconds).
+    SIZE_ERROR_LOG_INTERVAL = 30.0
+
     def __init__(
         self,
         agfs: Any,
@@ -95,6 +98,8 @@ class QueueManager:
         self._queue_threads: Dict[str, threading.Thread] = {}
         self._queue_stop_events: Dict[str, threading.Event] = {}
         self._poll_interval = 0.2
+        self._size_error_last_log_at: Dict[str, float] = {}
+        self._size_error_failing: Set[str] = set()
 
         atexit.register(self.stop)
         logger.info(
@@ -207,6 +212,40 @@ class QueueManager:
         finally:
             loop.close()
 
+    def _claim_size_log_slot(self, queue_name: str) -> bool:
+        """Rate-limit size-read logging to one line per queue per interval.
+
+        The throttle timestamp deliberately survives recovery. A flapping backend
+        alternates failure and success at the poll rate, so resetting it on every
+        success would emit a failure/recovery pair several times a second — worse
+        than no throttle at all.
+        """
+        now = time.monotonic()
+        last = self._size_error_last_log_at.get(queue_name)
+        if last is not None and (now - last) < self.SIZE_ERROR_LOG_INTERVAL:
+            return False
+        self._size_error_last_log_at[queue_name] = now
+        return True
+
+    def _log_size_failure(self, queue_name: str, exc: Exception) -> None:
+        """Report a size-read failure that has stalled a queue's drain loop."""
+        self._size_error_failing.add(queue_name)
+        if not self._claim_size_log_slot(queue_name):
+            return
+        logger.error(
+            f"[QueueManager] Size read failed for {queue_name}; drain loop is "
+            f"stalled until it recovers: {exc!r}"
+        )
+
+    def _clear_size_failure(self, queue_name: str) -> None:
+        """Report recovery after a size-read failure. No-op on the happy path."""
+        if queue_name not in self._size_error_failing:
+            return
+        self._size_error_failing.discard(queue_name)
+        if not self._claim_size_log_slot(queue_name):
+            return
+        logger.info(f"[QueueManager] Size read recovered for {queue_name}, resuming drain")
+
     async def _worker_async_concurrent(
         self, queue: NamedQueue, stop_event: threading.Event, max_concurrent: int
     ) -> None:
@@ -229,6 +268,15 @@ class QueueManager:
                     # Do NOT ack — let RecoverStale re-queue on next startup.
                     queue._on_process_error(str(e), data)
                     logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
+                except BaseException:
+                    # CancelledError is a BaseException, so it escapes the clause
+                    # above. Handlers re-raise it deliberately (see
+                    # session_commit_processor / add_resource_processor), and the
+                    # shutdown drain cancels in-flight tasks outright. Without this
+                    # the _on_dequeue_start() increment is never undone and
+                    # is_complete stays false for the life of the process.
+                    queue._on_process_cancelled()
+                    raise
 
         while not stop_event.is_set():
             # Prune completed tasks
@@ -238,8 +286,12 @@ class QueueManager:
             while len(active_tasks) < max_concurrent:
                 try:
                     queue_size = await queue.size()
-                except Exception:
+                except Exception as e:
+                    # A failing size read stalls this drain loop entirely. Make it
+                    # visible rather than polling silently forever.
+                    self._log_size_failure(queue.name, e)
                     break
+                self._clear_size_failure(queue.name)
                 if not queue.has_dequeue_handler() or queue_size == 0:
                     break
                 data = await queue.dequeue_raw()
@@ -288,6 +340,8 @@ class QueueManager:
                 logger.warning(f"[QueueManager] Worker thread {name} did not exit in time")
         self._queue_threads.clear()
         self._queue_stop_events.clear()
+        self._size_error_last_log_at.clear()
+        self._size_error_failing.clear()
 
         self._agfs = None
         self._queues.clear()

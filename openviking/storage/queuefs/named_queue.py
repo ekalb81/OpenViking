@@ -142,7 +142,7 @@ class NamedQueue:
     def _on_process_success(self) -> None:
         """Called on processing success."""
         with self._lock:
-            self._in_progress -= 1
+            self._in_progress = max(0, self._in_progress - 1)
             self._processed += 1
 
     def _on_process_requeue(self) -> None:
@@ -150,10 +150,21 @@ class NamedQueue:
         with self._lock:
             self._requeue_count += 1
 
+    def _on_process_cancelled(self) -> None:
+        """Called when processing is cancelled before reaching a terminal report.
+
+        Cancellation is not a processing error, so it must not raise error_count,
+        but the _on_dequeue_start() increment still has to be undone: is_complete
+        requires in_progress == 0, so a skipped decrement wedges every drain wait
+        on this queue until the process restarts.
+        """
+        with self._lock:
+            self._in_progress = max(0, self._in_progress - 1)
+
     def _on_process_error(self, error_msg: str, data: Optional[Dict[str, Any]] = None) -> None:
         """Called on processing failure."""
         with self._lock:
-            self._in_progress -= 1
+            self._in_progress = max(0, self._in_progress - 1)
             self._error_count += 1
             self._errors.append(
                 QueueError(
@@ -230,23 +241,50 @@ class NamedQueue:
         except Exception as e:
             logger.warning(f"[NamedQueue] Ack failed for {self.name} msg_id={msg_id}: {e}")
 
-    async def _read_queue_message(self) -> Optional[Dict[str, Any]]:
-        """Read and remove one message from the AGFS queue; return parsed dict or None.
+    @staticmethod
+    def _coerce_read_bytes(content: Any) -> Optional[bytes]:
+        """Normalise the return types AGFSClient.read() may produce.
 
-        Normalises the various return types AGFSClient.read() may produce.
+        The live binding client returns bytes, and the protocol declares bytes,
+        but read() is typed Any and the two readers in this class had drifted
+        into handling different shapes. This is the single owner of that
+        normalisation. The str and .content branches are defensive only — no
+        current backend produces them.
+
+        Returns None when the read yielded nothing. Raises TypeError for shapes
+        carrying no recoverable payload, so a caller can tell "empty" from
+        "unreadable" instead of conflating the two.
         """
-        content = await self._async_agfs.read(f"{self.path}/dequeue")
-        if not content or content == b"{}":
+        if content is None:
             return None
-        if isinstance(content, bytes):
-            raw = content
-        elif isinstance(content, str):
-            raw = content.encode("utf-8")
-        elif hasattr(content, "content") and content.content is not None:
-            raw = content.content
-        else:
-            raw = str(content).encode("utf-8")
-        return json.loads(raw.decode("utf-8"))
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            return bytes(content)
+        if isinstance(content, str):
+            return content.encode("utf-8")
+        inner = getattr(content, "content", None)
+        if isinstance(inner, (bytes, bytearray, memoryview)):
+            return bytes(inner)
+        if isinstance(inner, str):
+            return inner.encode("utf-8")
+        raise TypeError(f"Unexpected AGFS read response: {type(content).__name__}")
+
+    async def _read_queue_message(self) -> Optional[Dict[str, Any]]:
+        """Read and remove one message from the AGFS queue; return parsed dict or None."""
+        raw = self._coerce_read_bytes(await self._async_agfs.read(f"{self.path}/dequeue"))
+        if not raw:
+            return None
+        message = json.loads(raw.decode("utf-8"))
+        # An empty payload is the backend's "no message" marker, and it arrives in
+        # more encodings than a byte-exact b"{}" check catches (b"{}\n", b"{ }",
+        # b"[]", b"null"). Returning it verbatim would let the concurrent worker
+        # dispatch it -- it only breaks on None -- after having already counted it
+        # via _on_dequeue_start(). Every handler then hits its `if not data:
+        # return None` guard and returns WITHOUT reporting success or error, so
+        # the in_progress increment is never undone and is_complete on this queue
+        # can never become true again.
+        if not message:
+            return None
+        return message
 
     async def dequeue(self) -> Optional[Dict[str, Any]]:
         """Dequeue a message, process it, then ack to confirm deletion.
@@ -317,24 +355,24 @@ class NamedQueue:
             return None
 
     async def size(self) -> int:
-        """Get queue size."""
+        """Get queue size.
+
+        A missing size file, or one holding no bytes, means the queue is empty.
+        A storage fault or an undecodable payload is surfaced to the caller
+        rather than reported as empty, per #3417.
+        """
         await self._ensure_initialized()
         size_file = f"{self.path}/size"
 
         try:
             content = await self._async_agfs.read(size_file)
-            if content is None:
-                return 0
-            if isinstance(content, bytes):
-                text = content.decode("utf-8")
-            elif isinstance(content, str):
-                text = content
-            else:
-                raise TypeError(f"Unexpected queue size response: {type(content).__name__}")
-            text = text.strip()
-            return int(text) if text else 0
         except (AGFSNotFoundError, FileNotFoundError):
             return 0
+        raw = self._coerce_read_bytes(content)
+        if raw is None:
+            return 0
+        text = raw.decode("utf-8").strip()
+        return int(text) if text else 0
 
     async def clear(self) -> bool:
         """Clear queue."""
