@@ -632,6 +632,16 @@ impl QueueBackend for SQLiteQueueBackend {
             }
         };
 
+        // Decode before marking the row in-flight. Committing first and decoding
+        // afterwards leaves an undecodable row stuck in 'processing' while the
+        // caller gets only an error and never learns the message id, so nothing
+        // can ack it or put it back. Those rows are reset only when the backend
+        // is constructed, and the next start decodes them just as unsuccessfully,
+        // so the row is orphaned for good. Returning early here drops the
+        // transaction instead, which rolls back and leaves the row 'pending'.
+        let stored: StoredMessage =
+            serde_json::from_str(&raw_data).map_err(|e| Error::Serialization(e.to_string()))?;
+
         tx.execute(
             "UPDATE queue_messages
              SET status = 'processing', processing_started_at = ?1
@@ -643,8 +653,6 @@ impl QueueBackend for SQLiteQueueBackend {
         tx.commit()
             .map_err(|e| Error::internal(format!("sqlite transaction commit error: {}", e)))?;
 
-        let stored: StoredMessage =
-            serde_json::from_str(&raw_data).map_err(|e| Error::Serialization(e.to_string()))?;
         Ok(Some(stored.into_message()))
     }
 
@@ -964,6 +972,40 @@ mod tests {
         let recovered = reopened.dequeue("test").unwrap().unwrap();
         assert_eq!(recovered.id, msg_id);
         assert_eq!(recovered.data, b"recover me");
+    }
+
+    #[test]
+    fn test_sqlite_backend_undecodable_row_stays_pending() {
+        // A row that cannot be decoded must not be marked 'processing'. The
+        // caller gets an error and never learns the message id, so it could
+        // neither ack the row nor put it back, and only a restart would clear
+        // it -- which decodes it just as unsuccessfully. It has to stay pending.
+        let (_dir, db_path_str, mut backend) = sqlite_backend();
+        backend.create_queue("test").unwrap();
+        drop(backend);
+
+        let conn = Connection::open(&db_path_str).unwrap();
+        conn.execute(
+            "INSERT INTO queue_messages (queue_name, message_id, data, timestamp, status)
+             VALUES (?1, ?2, ?3, ?4, 'pending')",
+            params!["test", "bad-msg-id", "this is not json", 1776411459_i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut backend =
+            SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
+        assert!(backend.dequeue("test").is_err(), "undecodable row should error");
+
+        let conn = Connection::open(&db_path_str).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM queue_messages WHERE message_id = 'bad-msg-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending", "a failed decode must roll back the processing mark");
     }
 
     #[test]
