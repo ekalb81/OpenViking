@@ -86,10 +86,17 @@ class QueueManager:
 
     # Ceiling on a single handler run. A handler that never returns holds its
     # concurrency slot for the life of the process, and SessionCommit only has
-    # four, so a handful of hangs starves the queue outright. Generous enough
-    # that a real session-commit extraction (a long chain of LLM calls) is
-    # never cut short.
-    PROCESS_TIMEOUT_SECONDS = 900.0
+    # four, so a handful of hangs starves the queue outright.
+    #
+    # This is a hang detector, so it must sit well outside the normal runtime
+    # distribution. It previously did not: at 900s, per-handler instrumentation
+    # on 2026-07-29 measured four concurrent SessionCommit Phase-2 jobs at 38s,
+    # 446s, 775s and >900s, and the 775s run (a 3316KB / 2038-message archive)
+    # cleared the cap by only 125s. Runtime scales with concurrent load -- four
+    # worker slots, competing reindex traffic, and 60s embedding-provider retry
+    # backoff -- so the same message timed out on one run and succeeded on the
+    # next. That produced steady cancellation of work that would have completed.
+    PROCESS_TIMEOUT_SECONDS = 3600.0
 
     def __init__(
         self,
