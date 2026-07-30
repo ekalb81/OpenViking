@@ -8,6 +8,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -66,7 +67,18 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_ARCHIVE_WAIT_POLL_SECONDS = 0.1
+# Re-scan interval while an earlier archive is still non-terminal. This used to
+# be 0.1s, which turned every blocked Phase-2 job into a 10Hz scanner of every
+# earlier archive directory (~28 storage calls per 100ms for archive_015) for as
+# long as it held its worker slot.
+_ARCHIVE_WAIT_POLL_SECONDS = 2.0
+# Ceiling on that wait. An earlier archive whose own Phase-2 job is not running
+# will never reach a terminal state on its own, so waiting for it inside a
+# worker slot cannot succeed -- it only removes a slot from the pool. Give up
+# and let the queue re-deliver this message behind the work that has to finish
+# first. Well under QueueManager.PROCESS_TIMEOUT_SECONDS so the queue, not the
+# hang detector, decides the outcome.
+_ARCHIVE_WAIT_MAX_SECONDS = 600.0
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 _MEMORY_EXTRACTION_MAX_RETRIES = 3
 _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -78,6 +90,20 @@ _MEMORY_STEP_NAMES = ("long_term", "execution")
 
 class _ArchiveMessagesCorruptError(ValueError):
     """Raised when an archive messages file cannot be deserialized."""
+
+
+class ArchivePredecessorPendingError(RuntimeError):
+    """An earlier archive has not reached a terminal state yet.
+
+    This is a "not yet", not a failure of the archive that raises it. It must
+    reach the queue worker so the message is re-delivered later; it must not be
+    recorded as this archive's own failure, because that would make a healthy
+    archive permanently terminal on account of its predecessor.
+    """
+
+    # Read by QueueManager._should_requeue: re-delivery is the whole point, and
+    # the condition clears once the earlier archive's own Phase-2 job runs.
+    requeue = True
 
 
 def _is_storage_not_found(exc: BaseException) -> bool:
@@ -2686,6 +2712,12 @@ class Session:
             logger.info(f"Session {self.session_id} memory extraction completed")
         except asyncio.CancelledError:
             raise
+        except ArchivePredecessorPendingError:
+            # Not a failure of this archive. Writing a failed marker here would
+            # make a healthy archive permanently terminal because an earlier one
+            # had not finished, and would ack the message. Propagate so the queue
+            # re-delivers it once the predecessor is done.
+            raise
         except Exception as e:
             await self._write_failed_marker(
                 archive_uri,
@@ -3529,10 +3561,20 @@ class Session:
         return int(match.group(1))
 
     async def _wait_for_previous_archive_done(self, archive_index: int) -> bool:
-        """Wait until every earlier archive reaches a terminal state."""
+        """Wait until every earlier archive reaches a terminal state.
+
+        Bounded on purpose. An earlier archive only becomes terminal when its own
+        Phase-2 job runs, and that job needs a worker slot from the same small
+        pool this wait is occupying. Waiting indefinitely therefore cannot make
+        progress in the case that matters -- a predecessor whose job is not
+        running -- and it removes a slot from the pool while it tries, so a chain
+        of archives can take the whole pool and stall the queue. On expiry raise
+        ArchivePredecessorPendingError and let the queue re-deliver this message.
+        """
         if archive_index <= 1 or not self._viking_fs:
             return True
 
+        deadline = time.monotonic() + _ARCHIVE_WAIT_MAX_SECONDS
         while True:
             earlier_states = [
                 state
@@ -3549,6 +3591,17 @@ class Session:
                         [state.archive_id for state in non_completed],
                     )
                 return True
+
+            # Checked here, before the reconcile branch below, so that every path
+            # out of this loop is bounded. Reconciling then `continue`ing skips
+            # the sleep, so a reconcile that never makes an archive ready would
+            # otherwise spin without a deadline test at all.
+            if time.monotonic() >= deadline:
+                raise ArchivePredecessorPendingError(
+                    f"archive_{archive_index:03d} still has non-terminal earlier "
+                    f"archives after {_ARCHIVE_WAIT_MAX_SECONDS:.0f}s: "
+                    f"{[state.archive_id for state in pending_states]}"
+                )
 
             # A new-format intent without ready status may be left by a
             # process interruption. Reconcile it under the session lock rather
