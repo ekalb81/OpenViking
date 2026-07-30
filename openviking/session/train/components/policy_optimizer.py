@@ -11,6 +11,7 @@ from typing import Any
 from openviking.message import Message
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile, StoredLink
+from openviking.session.memory.experience_policy import validate_stored_experience
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_updater import ExtractContext
@@ -386,6 +387,28 @@ def _policy_to_memory_file(policy: Policy, *, memory_type: str = "experiences") 
         extra_fields=extra_fields,
     )
 
+def _experience_removal_allowed(memory_file: MemoryFile | None, uri: str) -> bool:
+    """Whether the optimizer may delete or supersede this stored experience.
+
+    Experience removal was disabled outright because pre-policy files could not
+    survive being rewritten or folded away. That precondition is now enforced
+    per file rather than per memory type: an experience is removable only if it
+    already satisfies the stored-experience policy.
+
+    A legacy-invalid file is therefore untouchable by construction, so a partial,
+    reverted, or future migration cannot expose one to automatic deletion. An
+    unreadable or unparseable file is treated as not removable — over-blocking
+    only forgoes a cleanup, while under-blocking destroys a memory.
+    """
+    if memory_file is None or not uri:
+        return False
+    try:
+        return not validate_stored_experience(memory_file, uri)
+    except Exception:
+        logger.warning("Experience removal gate could not validate %s; refusing removal", uri)
+        return False
+
+
 def _operations_to_plan_items(
     *,
     operations: Any,
@@ -463,15 +486,22 @@ def _operations_to_plan_items(
         if target_uri:
             upsert_target_uris.add(target_uri)
 
-    # Experience training is additive/update-only.  Legacy experience sources require a
-    # separately verified migration, so optimizer output must never turn either model-requested
-    # deletes or semantic-gradient supersession hints into automatic delete plan items.
-    if memory_type.casefold() == "experiences":
-        return items
+    # Experience removal used to be disabled wholesale here, because legacy sources
+    # predating the experience policy could not survive being folded away and the
+    # migration had not been done. That migration is complete, so the guard is now
+    # applied per file by _experience_removal_allowed: an experience is removable
+    # only while it satisfies the stored-experience policy, which keeps any
+    # legacy-invalid file untouchable by construction.
+    is_experience = memory_type.casefold() == "experiences"
 
     delete_uris: set[str] = set()
     for old_file in getattr(operations, "delete_file_contents", []) or []:
         target_uri = old_file.uri
+        if is_experience and not _experience_removal_allowed(old_file, target_uri):
+            logger.info(
+                "Skipping optimizer delete of non-conforming experience %s", target_uri
+            )
+            continue
         target_name = str(
             (old_file.extra_fields or {}).get(name_field)
             or (target_uri.rstrip("/").split("/")[-1].removesuffix(".md") if target_uri else "")
@@ -505,6 +535,13 @@ def _operations_to_plan_items(
 
     for policy in superseded_policies:
         if policy.uri in upsert_target_uris or policy.uri in delete_uris:
+            continue
+        if is_experience and not _experience_removal_allowed(
+            _policy_to_memory_file(policy, memory_type=memory_type), policy.uri
+        ):
+            logger.info(
+                "Skipping optimizer supersession of non-conforming experience %s", policy.uri
+            )
             continue
         items.append(
             PolicyPlanItem(
