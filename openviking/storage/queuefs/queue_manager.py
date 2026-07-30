@@ -7,6 +7,7 @@ All queues are managed through NamedQueue.
 
 import asyncio
 import atexit
+import hashlib
 import threading
 import time
 import traceback
@@ -98,6 +99,18 @@ class QueueManager:
     # next. That produced steady cancellation of work that would have completed.
     PROCESS_TIMEOUT_SECONDS = 3600.0
 
+    # How many times one message may be put back on the queue before the worker
+    # stops cycling it. Attempts are counted in memory, keyed by payload digest,
+    # rather than written into the payload: SessionCommitMsg.from_dict ignores
+    # unknown fields but not every handler message class promises that, and
+    # editing a payload to carry bookkeeping would be a worse defect than the
+    # one this bounds. The count is therefore lost on restart, which costs
+    # nothing: the backend re-queues every 'processing' row at start anyway.
+    REQUEUE_ATTEMPT_LIMIT = 5
+    # Ceiling on the attempt table so a long-lived process cannot accumulate one
+    # entry per distinct failing payload forever.
+    REQUEUE_TRACKER_MAX = 2048
+
     def __init__(
         self,
         agfs: Any,
@@ -121,6 +134,7 @@ class QueueManager:
         self._poll_interval = 0.2
         self._size_error_last_log_at: Dict[str, float] = {}
         self._size_error_failing: Set[str] = set()
+        self._requeue_attempts: Dict[str, int] = {}
 
         atexit.register(self.stop)
         logger.info(
@@ -279,25 +293,7 @@ class QueueManager:
 
         async def process_one(data: Dict[str, Any]) -> None:
             async with sem:
-                msg_id = data.get("id", "") if isinstance(data, dict) else ""
-                try:
-                    await self._process_with_retry(queue, data)
-                    # Ack after successful processing (delete from persistent storage).
-                    await queue.ack(msg_id)
-                except Exception as e:
-                    # Handler did not call report_error; decrement in_progress manually.
-                    # Do NOT ack — let RecoverStale re-queue on next startup.
-                    queue._on_process_error(str(e), data)
-                    logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
-                except BaseException:
-                    # CancelledError is a BaseException, so it escapes the clause
-                    # above. Handlers re-raise it deliberately (see
-                    # session_commit_processor / add_resource_processor), and the
-                    # shutdown drain cancels in-flight tasks outright. Without this
-                    # the _on_dequeue_start() increment is never undone and
-                    # is_complete stays false for the life of the process.
-                    queue._on_process_cancelled()
-                    raise
+                await self._process_and_settle(queue, data)
 
         while not stop_event.is_set():
             # Prune completed tasks
@@ -346,6 +342,145 @@ class QueueManager:
                     t.cancel()
                 await asyncio.gather(*active_tasks, return_exceptions=True)
 
+    @staticmethod
+    def _payload_digest(payload: str) -> str:
+        """Identify a message by its content, so requeues of it can be counted."""
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _should_requeue(exc: BaseException) -> bool:
+        """Whether a later attempt at this message could plausibly do better.
+
+        Deliberately narrow. A handler failure whose cause is in the message or
+        its data gains nothing from re-delivery -- it just spends the same work
+        again and, for SessionCommit, each attempt can occupy a slot for up to
+        PROCESS_TIMEOUT_SECONDS. Only conditions that are known to be about load
+        or ordering are re-queued:
+
+        - asyncio.TimeoutError: the handler was cancelled at the ceiling. Measured
+          Phase-2 runtimes scale with concurrent load, so the same message can
+          succeed on a quieter pass.
+        - anything advertising requeue=True: currently
+          ArchivePredecessorPendingError, which means "an earlier archive has not
+          finished", a condition that resolves once that archive's own job runs.
+
+        Everything else keeps the previous behaviour of leaving the row for the
+        backend to reset at the next process start. That is not ideal, but a
+        Phase-2 extraction failure already ends in a .failed.json marker and a
+        normal return, so it is acked rather than parked; the paths that reach
+        here with some other exception are rare and not yet shown to be
+        transient. Widening this needs that evidence first.
+        """
+        return isinstance(exc, asyncio.TimeoutError) or bool(getattr(exc, "requeue", False))
+
+    async def _process_and_settle(self, queue: NamedQueue, data: Dict[str, Any]) -> None:
+        """Run one message and leave it in a settled state: acked or re-queued.
+
+        Every exit from here must either delete the message's 'processing' row or
+        put the message back on the queue. Leaving the row behind is not a safe
+        default: the backend resets 'processing' rows only when it is
+        constructed, so a parked row is invisible for the rest of the process
+        lifetime, and the restart that would recover it re-dequeues the message
+        into the same conditions that just failed it. That converts one
+        transient failure into an indefinite, silent stall.
+        """
+        msg_id = data.get("id", "") if isinstance(data, dict) else ""
+        payload = data.get("data") if isinstance(data, dict) else None
+        started = time.monotonic()
+        try:
+            await self._process_with_retry(queue, data)
+        except Exception as exc:
+            # Handler did not call report_error; decrement in_progress manually.
+            # repr() rather than str(): str(asyncio.TimeoutError()) is empty, so
+            # the old message logged the failure with no failure in it.
+            queue._on_process_error(repr(exc), data)
+            logger.error(
+                f"[QueueManager] Handler failed for {queue.name} after "
+                f"{time.monotonic() - started:.1f}s: {exc!r}"
+            )
+            if self._should_requeue(exc):
+                await self._requeue_failed_message(queue, msg_id, payload)
+            return
+        except BaseException:
+            # CancelledError is a BaseException, so it escapes the clause above.
+            # Handlers re-raise it deliberately (see session_commit_processor /
+            # add_resource_processor), and the shutdown drain cancels in-flight
+            # tasks outright. Without this the _on_dequeue_start() increment is
+            # never undone and is_complete stays false for the life of the
+            # process. No requeue here: this is the shutdown path, and the
+            # backend re-queues the row at the next start.
+            queue._on_process_cancelled()
+            raise
+        if isinstance(payload, str):
+            self._requeue_attempts.pop(self._payload_digest(payload), None)
+        await queue.ack(msg_id)
+        logger.debug(
+            f"[QueueManager] {queue.name} message completed in "
+            f"{time.monotonic() - started:.1f}s"
+        )
+
+    async def _requeue_failed_message(
+        self, queue: NamedQueue, msg_id: str, payload: Optional[Any]
+    ) -> None:
+        """Put a failed message back on the queue rather than parking its row.
+
+        Enqueue first, ack second. A crash between the two redelivers the
+        message, which at-least-once delivery already permits and which Phase-2
+        handlers already guard against via their .done marker check. The reverse
+        order would drop the message outright on the same crash.
+
+        Falling back to parking is deliberate in the cases below. Parking is bad
+        but recoverable at the next start; acking a message we could not
+        re-enqueue would destroy it.
+
+        Note for anyone adding an EnqueueHookBase to a queue that reaches here:
+        this goes through NamedQueue.enqueue, so the hook runs again on the
+        requeued payload. No queue sets one today, and one that does needs to be
+        idempotent or to exclude requeues.
+        """
+        if not msg_id or not isinstance(payload, str):
+            logger.error(
+                f"[QueueManager] Cannot requeue a {queue.name} message without a "
+                f"message id and string payload; leaving its row for recovery at "
+                f"the next process start"
+            )
+            return
+
+        digest = self._payload_digest(payload)
+        attempts = self._requeue_attempts.get(digest, 0) + 1
+        if attempts > self.REQUEUE_ATTEMPT_LIMIT:
+            logger.error(
+                f"[QueueManager] A {queue.name} message has failed "
+                f"{self.REQUEUE_ATTEMPT_LIMIT} requeues; leaving its row parked "
+                f"instead of cycling it further. It gets one more attempt at the "
+                f"next process start."
+            )
+            self._requeue_attempts.pop(digest, None)
+            return
+
+        # Count the attempt before the write. If the enqueue fails we have spent
+        # an attempt on a message that stayed parked, which is harmless; not
+        # counting it first would let a failing enqueue reset the budget forever.
+        if len(self._requeue_attempts) >= self.REQUEUE_TRACKER_MAX:
+            # Crude, but bounded and predictable: the table only holds failure
+            # bookkeeping, and losing it costs at most a few extra attempts.
+            self._requeue_attempts.clear()
+        self._requeue_attempts[digest] = attempts
+
+        try:
+            await queue.enqueue(payload)
+        except Exception as exc:
+            logger.error(
+                f"[QueueManager] Requeue failed for {queue.name}: {exc!r}; leaving "
+                f"its row for recovery at the next process start"
+            )
+            return
+        await queue.ack(msg_id)
+        logger.warning(
+            f"[QueueManager] Re-queued a failed {queue.name} message "
+            f"(attempt {attempts}/{self.REQUEUE_ATTEMPT_LIMIT})"
+        )
+
     async def _process_with_retry(self, queue: NamedQueue, data: Dict[str, Any]) -> Any:
         """Run the dequeue handler, retrying failures that advertise retryable=True.
 
@@ -354,11 +489,10 @@ class QueueManager:
         "fresh" until it expires, so a write that lands inside that window is
         rejected even though the condition clears itself minutes later.
 
-        Without an in-process retry such a message keeps its 'processing' row
-        and only the backend's RecoverStale, which runs at process start, puts
-        it back. That is not enough on its own: a restart re-runs the same race
-        against the same not-yet-expired lock, so the message can be parked
-        again immediately and stay parked across any number of restarts.
+        Retrying here, in the same slot, is worth doing for a conflict that
+        clears in seconds: it avoids a full trip back through the queue. Failures
+        that survive this budget are handed to _process_and_settle, which returns
+        the message to the queue rather than leaving its row parked.
         """
         last_exc: Optional[Exception] = None
         for attempt in range(self.PROCESS_RETRY_LIMIT + 1):
@@ -367,10 +501,10 @@ class QueueManager:
                     queue.process_dequeued(data), timeout=self.PROCESS_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
-                # Deliberately not retried: a hang is not a transient conflict,
-                # and re-running it would tie the slot up for another full
-                # timeout. Free the slot and let RecoverStale re-queue the
-                # message at the next process start.
+                # Deliberately not retried in this slot: re-running immediately
+                # would tie the slot up for another full timeout. Free the slot
+                # and let _process_and_settle put the message back on the queue,
+                # where it is retried behind whatever else is waiting.
                 logger.error(
                     f"[QueueManager] Handler for {queue.name} exceeded "
                     f"{self.PROCESS_TIMEOUT_SECONDS:.0f}s and was cancelled; "
