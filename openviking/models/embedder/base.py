@@ -235,6 +235,26 @@ class EmbedderBase(ABC):
     async def embed_query_async(self, text: str) -> EmbedResult:
         return await self.embed_async(text, is_query=True)
 
+    async def embed_batch_async(
+        self, contents: List["EmbeddingInput"], is_query: bool = False
+    ) -> List[EmbedResult]:
+        """Embed many inputs, preserving order.
+
+        The default fans out to ``embed_async`` so every embedder supports the
+        interface; concurrency stays bounded by the shared async semaphore.
+        Providers whose API accepts an array of inputs should override this
+        with a true single-request implementation -- the per-request overhead
+        dominates the cost of a single-text call, so N single calls are close
+        to N times the price of one batched call.
+        """
+        if not contents:
+            return []
+        return list(
+            await asyncio.gather(
+                *(self.embed_async(content, is_query=is_query) for content in contents)
+            )
+        )
+
     def close(self):
         """Release resources, subclasses can override as needed"""
         pass

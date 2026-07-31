@@ -648,6 +648,27 @@ class EmbeddingConfig(BaseModel):
         ge=100,
         description="Maximum estimated tokens sent to embeddings when raw text fallback is used",
     )
+    micro_batch_enabled: bool = Field(
+        default=True,
+        description=(
+            "Coalesce concurrent document-embedding calls into one array request. "
+            "Per-request overhead dominates single-text calls, so batching cuts "
+            "per-text latency by an order of magnitude on array-capable providers."
+        ),
+    )
+    micro_batch_size: int = Field(
+        default=32,
+        ge=1,
+        description="Maximum texts per coalesced embedding request",
+    )
+    micro_batch_wait_ms: float = Field(
+        default=10.0,
+        ge=0.0,
+        description=(
+            "How long a document embedding waits for others to coalesce with. "
+            "Paid only by lone sequential calls; noise against the request round trip."
+        ),
+    )
     allow_metadata_override: bool = Field(
         default=False,
         description=(
@@ -738,6 +759,9 @@ class EmbeddingConfig(BaseModel):
             "max_retries": self.max_retries,
             "max_concurrent": self.max_concurrent,
             "max_input_tokens": self.max_input_tokens,
+            "micro_batch_enabled": self.micro_batch_enabled,
+            "micro_batch_size": self.micro_batch_size,
+            "micro_batch_wait_ms": self.micro_batch_wait_ms,
         }
 
         factory_registry = {
