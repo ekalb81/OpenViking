@@ -246,6 +246,14 @@ class EmbedderBase(ABC):
         with a true single-request implementation -- the per-request overhead
         dominates the cost of a single-text call, so N single calls are close
         to N times the price of one batched call.
+
+        Deliberately unreferenced in production as of 2026-07: every document
+        embedding funnels through the queue handler, whose concurrent
+        single-text calls the embedder-level micro-batcher already coalesces
+        (see micro_batcher.py). This exists as the interface for a future bulk
+        path that bypasses the queue -- a direct reindex, say -- and is kept
+        correct by the embedder unit tests, not by any live caller. Finding no
+        callers is not a bug.
         """
         if not contents:
             return []
