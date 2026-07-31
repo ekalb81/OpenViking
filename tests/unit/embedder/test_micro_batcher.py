@@ -92,19 +92,33 @@ async def test_provider_failure_reaches_every_caller():
     )
 
     assert all(isinstance(o, RuntimeError) for o in outcomes)
-    assert len(flush.batches) == 1
+    # The failed batch degrades to singles, aborting after two failed probes:
+    # one batch call plus two individual attempts, never one per caller.
+    assert [len(b) for b in flush.batches] == [3, 1, 1]
 
 
 @pytest.mark.asyncio
-async def test_result_count_mismatch_is_an_error_not_a_misassignment():
-    async def short_flush(texts):
-        return [EmbedResult(dense_vector=[1.0])]  # one result for N inputs
+async def test_result_count_mismatch_recovers_via_singles_without_misassignment():
+    """A short batch response must never distribute wrong vectors.
 
-    batcher = EmbedMicroBatcher(short_flush, max_batch_size=8, max_wait_ms=5.0)
-    outcomes = await asyncio.gather(
-        *(batcher.submit(f"t{i}") for i in range(3)), return_exceptions=True
-    )
-    assert all(isinstance(o, RuntimeError) for o in outcomes)
+    The batch-level mismatch is refused outright; degradation then re-issues
+    each text alone, where a one-for-one response is well-formed, so callers
+    recover with vectors that are provably their own.
+    """
+    calls: list[list[str]] = []
+
+    async def per_text_flush(texts):
+        calls.append(list(texts))
+        if len(texts) > 1:
+            return [EmbedResult(dense_vector=[1.0])]  # short: one row for N inputs
+        return [EmbedResult(dense_vector=[float(hash(texts[0]) % 97)])]
+
+    batcher = EmbedMicroBatcher(per_text_flush, max_batch_size=8, max_wait_ms=5.0)
+    results = await asyncio.gather(*(batcher.submit(f"t{i}") for i in range(3)))
+
+    assert calls[0] == ["t0", "t1", "t2"] and len(calls) == 4
+    for i, result in enumerate(results):
+        assert result.dense_vector == [float(hash(f"t{i}") % 97)]
 
 
 @pytest.mark.asyncio
@@ -119,3 +133,70 @@ async def test_batches_keep_flowing_after_a_failure():
     flush.fail_with = None
     good = await batcher.submit("b")
     assert good.dense_vector == [float(hash("b") % 97)]
+
+
+# --- poison isolation: a failed batch degrades to singles, bounded ----------
+
+
+class PoisonFlush:
+    """Fails any batch containing 'poison'; individual calls succeed except poison."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, texts):
+        self.calls.append(list(texts))
+        if any(t == "poison" for t in texts):
+            raise RuntimeError("400 input rejected")
+        return [EmbedResult(dense_vector=[float(hash(t) % 97)]) for t in texts]
+
+
+@pytest.mark.asyncio
+async def test_poison_text_fails_alone_and_neighbours_succeed():
+    flush = PoisonFlush()
+    batcher = EmbedMicroBatcher(flush, max_batch_size=8, max_wait_ms=5.0)
+
+    texts = ["a", "b", "poison", "c"]
+    outcomes = await asyncio.gather(
+        *(batcher.submit(t) for t in texts), return_exceptions=True
+    )
+
+    # The batch call failed, then each text was re-issued individually.
+    assert flush.calls[0] == texts
+    assert isinstance(outcomes[2], RuntimeError), "the poison text itself must fail"
+    for i in (0, 1, 3):
+        assert isinstance(outcomes[i], EmbedResult), f"neighbour {texts[i]} must succeed"
+        assert outcomes[i].dense_vector == [float(hash(texts[i]) % 97)]
+
+
+@pytest.mark.asyncio
+async def test_outage_aborts_degradation_after_two_failures():
+    calls = []
+
+    async def always_down(texts):
+        calls.append(list(texts))
+        raise RuntimeError("provider down")
+
+    batcher = EmbedMicroBatcher(always_down, max_batch_size=8, max_wait_ms=5.0)
+    outcomes = await asyncio.gather(
+        *(batcher.submit(f"t{i}") for i in range(6)), return_exceptions=True
+    )
+
+    assert all(isinstance(o, RuntimeError) for o in outcomes)
+    # One batch attempt plus exactly two individual probes -- not six.
+    assert len(calls) == 3, f"expected bounded degradation, saw calls: {calls}"
+
+
+@pytest.mark.asyncio
+async def test_single_item_failure_does_not_degrade():
+    calls = []
+
+    async def failing(texts):
+        calls.append(list(texts))
+        raise RuntimeError("boom")
+
+    batcher = EmbedMicroBatcher(failing, max_batch_size=8, max_wait_ms=5.0)
+    outcome = await asyncio.gather(batcher.submit("solo"), return_exceptions=True)
+
+    assert isinstance(outcome[0], RuntimeError)
+    assert len(calls) == 1, "a batch of one has nothing to degrade to"

@@ -103,16 +103,36 @@ async def test_embed_batch_async_chunks_to_the_size_cap(fake):
 
 
 @pytest.mark.asyncio
-async def test_short_response_is_an_error(fake, monkeypatch):
+async def test_short_response_recovers_via_singles(fake, monkeypatch):
+    """A provider that mis-counts batch rows degrades to per-text requests.
+
+    The batch response (one row for N inputs) is refused rather than
+    mis-assigned; each text is then re-issued alone, where one row for one
+    input is well-formed, so callers recover.
+    """
+    calls: list[int] = []
+
     async def short(**kwargs):
+        calls.append(len(kwargs["input"]))
         return SimpleNamespace(data=[{"index": 0, "embedding": [1.0, 0.0]}], usage=None)
 
     monkeypatch.setattr(mod.litellm, "aembedding", short)
     embedder = _embedder()
-    outcomes = await asyncio.gather(
-        *(embedder.embed_async(f"doc {i}") for i in range(3)), return_exceptions=True
-    )
-    assert all(isinstance(o, RuntimeError) for o in outcomes)
+    results = await asyncio.gather(*(embedder.embed_async(f"doc {i}") for i in range(3)))
+
+    assert calls == [3, 1, 1, 1], "one refused batch, then one request per text"
+    assert all(r.dense_vector is not None for r in results)
+
+
+@pytest.mark.asyncio
+async def test_short_response_on_a_single_text_is_a_hard_error(fake, monkeypatch):
+    async def empty(**kwargs):
+        return SimpleNamespace(data=[], usage=None)
+
+    monkeypatch.setattr(mod.litellm, "aembedding", empty)
+    embedder = _embedder()
+    with pytest.raises(RuntimeError):
+        await embedder.embed_async("doc")
 
 
 @pytest.mark.asyncio

@@ -90,10 +90,47 @@ class EmbedMicroBatcher:
                     f"Batch embedding returned {len(results)} results for {len(batch)} inputs"
                 )
         except Exception as exc:
-            for _, future in batch:
-                if not future.done():
-                    future.set_exception(exc)
+            await self._degrade_to_singles(batch, exc)
             return
         for (_, future), result in zip(batch, results):
             if not future.done():
                 future.set_result(result)
+
+    async def _degrade_to_singles(
+        self, batch: List[Tuple[str, asyncio.Future]], batch_exc: Exception
+    ) -> None:
+        """Re-issue a failed batch one text at a time so poison cannot spread.
+
+        Batching correlates failures: one rejected input -- an oversized chunk
+        drawing a 400, say -- would fail every coalesced neighbour, and
+        retrying the batch re-sends the same poison each time. Degrading to
+        single requests isolates the bad input while its neighbours succeed.
+
+        The degradation is bounded by a two-failure abort: one individual
+        failure looks like a poison text, but a second means the provider
+        itself is unhappy, and hammering it with the rest of the batch as
+        singles would only add load to an outage. Remaining callers then get
+        the original batch error.
+        """
+        if len(batch) == 1:
+            _, future = batch[0]
+            if not future.done():
+                future.set_exception(batch_exc)
+            return
+        failures = 0
+        for text, future in batch:
+            if future.done():
+                continue
+            if failures >= 2:
+                future.set_exception(batch_exc)
+                continue
+            try:
+                results = await self._flush_fn([text])
+                if len(results) != 1:
+                    raise RuntimeError(
+                        f"Batch embedding returned {len(results)} results for 1 input"
+                    )
+                future.set_result(results[0])
+            except Exception as item_exc:
+                failures += 1
+                future.set_exception(item_exc)
