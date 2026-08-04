@@ -28,6 +28,7 @@ from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
 from openviking.session.memory.merge_op import FieldType, MergeOp
+from openviking.storage.errors import LockAcquisitionError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import get_openviking_config, initialize_openviking_config
 
@@ -475,7 +476,9 @@ class TestCompressorV2:
         )
 
         with (
-            patch("openviking.storage.viking_fs.get_viking_fs", return_value=None),
+            # compressor_v2 binds get_viking_fs at import time, so the patch has to
+            # replace the name in that module rather than in its source module.
+            patch("openviking.session.compressor_v2.get_viking_fs", return_value=None),
             patch(
                 "openviking.session.memory.memory_type_registry.create_default_registry",
                 return_value=dummy_registry,
@@ -529,8 +532,14 @@ class TestCompressorV2:
         dummy_registry.initialize_memory_files.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_v2_lock_acquire_waits_without_retry_loop(self):
-        """v2 memory extraction should delegate waiting to lock manager without local retries."""
+    async def test_v2_lock_acquire_retries_to_the_configured_limit(self):
+        """v2 memory extraction should retry the pathlock batch up to v2_lock_max_retries.
+
+        The lock manager this test was written against is gone; acquisition now goes
+        through ``AsyncAGFSClient.pathlock_acquire_exact_tree_batch`` with a short
+        per-attempt timeout, and the waiting happens in this retry loop rather than
+        inside the lock implementation.
+        """
         compressor = SessionCompressorV2(vikingdb=None)
         user = UserIdentifier.the_default_user()
         ctx = RequestContext(user=user, role=Role.ROOT)
@@ -573,14 +582,22 @@ class TestCompressorV2:
                     [],
                 )
 
-        lock_manager = SimpleNamespace(
-            create_handle=lambda: object(),
-            acquire_exact_tree_batch=AsyncMock(return_value=False),
-            release=AsyncMock(),
+        acquire = AsyncMock(side_effect=LockAcquisitionError("held by another writer"))
+        viking_fs = MockVikingFS()
+        viking_fs.agfs = object()
+        # MockVikingFS._uri_to_path is an identity stub; apply the documented
+        # prefix rule (viking://{rest} -> /local/{account}/{rest}) so the lock
+        # paths below are the shape the real FS would hand to the pathlock.
+        viking_fs._uri_to_path = lambda uri, ctx=None: uri.replace(
+            "viking://", f"/local/{ctx.account_id if ctx else 'default'}/"
+        )
+        viking_fs._async_agfs = SimpleNamespace(
+            pathlock_acquire_exact_tree_batch=acquire,
+            pathlock_release=AsyncMock(),
         )
 
         with (
-            patch("openviking.session.compressor_v2.get_viking_fs", return_value=MockVikingFS()),
+            patch("openviking.session.compressor_v2.get_viking_fs", return_value=viking_fs),
             patch(
                 "openviking.session.memory.memory_type_registry.create_default_registry",
                 return_value=SimpleNamespace(initialize_memory_files=AsyncMock()),
@@ -598,10 +615,12 @@ class TestCompressorV2:
             )
 
         assert result == []
-        assert lock_manager.acquire_exact_tree_batch.await_count == 2
-        _, kwargs = lock_manager.acquire_exact_tree_batch.await_args
-        assert kwargs["exact_paths"] == ["/local/default/user/default/memories/profile.md"]
-        assert kwargs["tree_paths"] == ["/local/default/user/default/memories/events"]
+        assert acquire.await_count == 2
+        exact_paths, tree_paths = acquire.await_args.args
+        assert exact_paths == ["/local/default/user/default/memories/profile.md"]
+        assert tree_paths == ["/local/default/user/default/memories/events"]
+        # A batch that never acquires must not leave a lease behind to release.
+        viking_fs._async_agfs.pathlock_release.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_extract_phase_runs_post_apply_before_lock_release(self):
@@ -612,8 +631,22 @@ class TestCompressorV2:
         messages = [Message(id="msg-test", role="user", parts=[TextPart("test")])]
         events: List[str] = []
 
+        lease = SimpleNamespace(id="lease-1")
+
+        async def acquire_exact_tree_batch(*args, **kwargs):
+            events.append("acquire")
+            return lease
+
+        async def release(ref):
+            assert ref is lease
+            events.append("release")
+
         class FakeVikingFS:
             agfs = object()
+            _async_agfs = SimpleNamespace(
+                pathlock_acquire_exact_tree_batch=acquire_exact_tree_batch,
+                pathlock_release=release,
+            )
 
             def _uri_to_path(self, uri: str, ctx=None) -> str:
                 return uri
@@ -666,19 +699,12 @@ class TestCompressorV2:
                 v2_lock_retry_interval_seconds=0.0,
             ),
         )
-        handle = SimpleNamespace(id="handle-1", locks=[])
-
-        async def acquire_exact_tree_batch(*args, **kwargs):
-            events.append("acquire")
-            return True
-
-        async def release(_handle):
-            events.append("release")
-
-        async def post_apply(result, inheritance_map, lock_handle):
+        async def post_apply(result, inheritance_map, lease_ref):
             assert result.written_uris == ["viking://user/default/memories/experiences/debug.md"]
             assert inheritance_map == {}
-            assert lock_handle is handle
+            # The callback receives the live lease, so its writes ride the same
+            # pathlock the phase acquired.
+            assert lease_ref is lease
             events.append("post_apply")
 
         with (

@@ -248,7 +248,7 @@ class TestMemoryUpdater:
             async def ls(self, uri, show_all_hidden=False, ctx=None):
                 return [{"name": ".overview.md", "isDir": False}]
 
-            async def rm(self, uri, recursive=False, ctx=None):
+            async def rm(self, uri, recursive=False, ctx=None, lease_ref=None):
                 self.rm_calls.append((uri, recursive))
 
         viking_fs = FakeVikingFS()
@@ -290,7 +290,7 @@ class TestMemoryUpdater:
             async def ls(self, uri, show_all_hidden=False, ctx=None):
                 raise NotFoundError(uri, "directory")
 
-            async def rm(self, uri, recursive=False, ctx=None):
+            async def rm(self, uri, recursive=False, ctx=None, lease_ref=None):
                 self.rm_calls.append((uri, recursive))
 
         viking_fs = FakeVikingFS()
@@ -362,7 +362,7 @@ class TestMemoryUpdater:
             async def read_file(self, uri, ctx=None):
                 return self.store[uri]
 
-            async def write_file(self, uri, content, ctx=None):
+            async def write_file(self, uri, content, ctx=None, lease_ref=None):
                 self.store[uri] = content
 
         viking_fs = FakeVikingFS()
@@ -407,7 +407,7 @@ class TestMemoryUpdater:
             async def read_file(self, uri, ctx=None):
                 return self.store[uri]
 
-            async def write_file(self, uri, content, ctx=None):
+            async def write_file(self, uri, content, ctx=None, lease_ref=None):
                 self.store[uri] = content
 
         viking_fs = FakeVikingFS()
@@ -627,6 +627,7 @@ class TestMemoryUpdater:
             expected_directory,
             ctx,
             None,
+            lease_ref=None,
         )
 
     @pytest.mark.asyncio
@@ -680,10 +681,10 @@ class TestMemoryUpdater:
             ],
         )
 
-        async def mock_apply_upsert(resolved_op, ctx, extract_context=None):
+        async def mock_apply_upsert(resolved_op, ctx, extract_context=None, lease_ref=None):
             return None
 
-        async def mock_apply_delete(uri, ctx):
+        async def mock_apply_delete(uri, ctx, lease_ref=None):
             assert uri == deleted_uri
 
         updater._apply_upsert = AsyncMock(side_effect=mock_apply_upsert)
@@ -795,7 +796,7 @@ class TestMemoryUpdater:
         mock_viking_fs = MagicMock()
         mock_viking_fs.read_file = AsyncMock(side_effect=lambda uri, ctx=None: files[uri])
 
-        async def write_file(uri, content, ctx=None):
+        async def write_file(uri, content, ctx=None, lease_ref=None):
             files[uri] = content
 
         mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
