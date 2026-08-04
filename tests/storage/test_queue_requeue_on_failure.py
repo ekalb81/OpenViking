@@ -43,7 +43,8 @@ class _FakeQueue:
             raise self._exc
         return data
 
-    async def ack(self, msg_id):
+    async def ack(self, msg_id, message=None):
+        del message
         self.acked.append(msg_id)
 
     async def enqueue(self, payload):

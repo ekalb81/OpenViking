@@ -13,6 +13,7 @@ import time
 import traceback
 from typing import Any, Dict, Optional, Set, Union
 
+from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_queue import EmbeddingQueue
@@ -135,6 +136,7 @@ class QueueManager:
         self._size_error_last_log_at: Dict[str, float] = {}
         self._size_error_failing: Set[str] = set()
         self._requeue_attempts: Dict[str, int] = {}
+        self._task_work_index = TaskWorkIndex()
 
         atexit.register(self.stop)
         logger.info(
@@ -153,6 +155,13 @@ class QueueManager:
             self._start_queue_worker(queue)
 
         logger.info(f"[QueueManager] mount_point={self.mount_point} Started")
+
+    async def prepare_task_tracking(self, tracker: Any) -> None:
+        """Rebuild task work from QueueFS before any consumer starts."""
+        snapshots = {name: await queue.snapshot() for name, queue in self._queues.items()}
+        owners = self._task_work_index.rebuild(snapshots)
+        tracker.attach_work_index(self._task_work_index)
+        await tracker.restore_work_tasks(owners)
 
     def setup_standard_queues(self, vector_store: Any, start: bool = True) -> None:
         """
@@ -413,7 +422,7 @@ class QueueManager:
             raise
         if isinstance(payload, str):
             self._requeue_attempts.pop(self._payload_digest(payload), None)
-        await queue.ack(msg_id)
+        await queue.ack(msg_id, data)
         logger.debug(
             f"[QueueManager] {queue.name} message completed in "
             f"{time.monotonic() - started:.1f}s"
@@ -475,6 +484,10 @@ class QueueManager:
                 f"its row for recovery at the next process start"
             )
             return
+        # Ack without the message on purpose: passing it would release this
+        # message's entry in the task work index, and the requeued copy carries
+        # the same _task_work_id, so the owning task would look idle while its
+        # work is still queued. The re-delivered message releases it on success.
         await queue.ack(msg_id)
         logger.warning(
             f"[QueueManager] Re-queued a failed {queue.name} message "
@@ -577,6 +590,7 @@ class QueueManager:
                     name,
                     enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
+                    task_work_index=self._task_work_index,
                 )
             elif name == self.SEMANTIC:
                 self._queues[name] = SemanticQueue(
@@ -585,6 +599,7 @@ class QueueManager:
                     name,
                     enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
+                    task_work_index=self._task_work_index,
                 )
             else:
                 self._queues[name] = NamedQueue(
@@ -593,6 +608,7 @@ class QueueManager:
                     name,
                     enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
+                    task_work_index=self._task_work_index,
                 )
             if self._started:
                 self._start_queue_worker(self._queues[name])

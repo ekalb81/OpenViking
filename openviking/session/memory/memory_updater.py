@@ -215,17 +215,17 @@ async def write_stored_links(
     viking_fs: Any,
     skip_uris: Optional[set] = None,
     preserve_version_uris: Optional[set] = None,
-    lock_handle: Any = None,
+    lease_ref: Any = None,
 ) -> List[str]:
     """Write StoredLinks to their endpoint files' links/backlinks fields.
 
     For each link: from_uri's ``links`` receives the forward link;
     to_uri's ``backlinks`` receives the reverse reference.
     Files listed in skip_uris are skipped (caller handles them in the same write).
-    When lock_handle is provided, all endpoint rewrites reuse that transaction.
+    When lease_ref is provided, all endpoint rewrites reuse that pathlock lease.
     All endpoints are read and rendered before the first write. If a later
     endpoint write fails, every attempted endpoint is restored from its
-    pre-publication content using the same lock handle. This compensation is
+    pre-publication content using the same lease. This compensation is
     best-effort rather than a true cross-file transaction: a rollback write can
     itself fail, and callers without a lock remain exposed to concurrent writes.
 
@@ -236,7 +236,6 @@ async def write_stored_links(
 
     skip = skip_uris or set()
     preserve_versions = preserve_version_uris or set()
-    lock_kwargs = {"lock_handle": lock_handle} if lock_handle is not None else {}
     endpoint_content: Dict[str, Any] = {}
     experience_endpoints = list(
         dict.fromkeys(
@@ -310,7 +309,7 @@ async def write_stored_links(
                 uri,
                 updated_content,
                 ctx=ctx,
-                **lock_kwargs,
+                lease_ref=lease_ref,
             )
             readback = await viking_fs.read_file(uri, ctx=ctx)
             if readback != updated_content:
@@ -323,7 +322,7 @@ async def write_stored_links(
                         rollback_uri,
                         rollback_content,
                         ctx=ctx,
-                        **lock_kwargs,
+                        lease_ref=lease_ref,
                     )
                     rollback_readback = await viking_fs.read_file(rollback_uri, ctx=ctx)
                     if rollback_readback != rollback_content:
@@ -338,7 +337,6 @@ async def write_stored_links(
                     )
             raise _LinkPublicationError(uri, "write", e, rollback_failures) from e
     return [uri for uri, _, _ in prepared_writes]
-
 
 
 def _remap_link_dict(link: Dict[str, Any], uri_remap: Dict[str, str]) -> Dict[str, Any]:
@@ -361,6 +359,7 @@ def remap_stored_links(links: List[StoredLink], uri_remap: Dict[str, str]) -> Li
             continue
         remapped_links.append(link.model_copy(update={"from_uri": from_uri, "to_uri": to_uri}))
     return remapped_links
+
 
 def _operation_trace_id(op: ResolvedOperation) -> str | None:
     source = getattr(op, "source", None)
@@ -503,6 +502,7 @@ class ExtractContext:
     def get_year(self, ranges_str: str) -> str:
         """根据 ranges 字符串获取第一条消息的年份，fallback 到当前年份"""
         from datetime import datetime
+
         if not ranges_str:
             return str(datetime.now().year)
         msg_range = self.read_message_ranges(ranges_str)
@@ -514,6 +514,7 @@ class ExtractContext:
     def get_month(self, ranges_str: str) -> str:
         """根据 ranges 字符串获取第一条消息的月份，fallback 到当前月份"""
         from datetime import datetime
+
         if not ranges_str:
             return f"{datetime.now().month:02d}"
         msg_range = self.read_message_ranges(ranges_str)
@@ -525,6 +526,7 @@ class ExtractContext:
     def get_day(self, ranges_str: str) -> str:
         """根据 ranges 字符串获取第一条消息的日期，fallback 到当前日期"""
         from datetime import datetime
+
         if not ranges_str:
             return f"{datetime.now().day:02d}"
         msg_range = self.read_message_ranges(ranges_str)
@@ -947,8 +949,12 @@ class MemoryUpdater:
     """
 
     def __init__(
-        self, registry: Optional[MemoryTypeRegistry] = None, vikingdb=None, transaction_handle=None
+        self,
+        registry: Optional[MemoryTypeRegistry] = None,
+        vikingdb=None,
+        transaction_handle: Any = None,
     ):
+        """Create a memory updater with an optional pathlock transaction handle."""
         self._viking_fs = None
         self._registry = registry
         self._vikingdb = vikingdb
@@ -1195,6 +1201,7 @@ class MemoryUpdater:
                     resolved_op,
                     ctx,
                     extract_context=extract_context,
+                    lease_ref=self._transaction_handle,
                 )
                 # Add all uris to result (uris is List[str])
                 if resolved_op.is_edit():
@@ -1382,7 +1389,7 @@ class MemoryUpdater:
                 )
                 continue
             try:
-                await self._apply_delete(delete_uri, ctx)
+                await self._apply_delete(delete_uri, ctx, lease_ref=self._transaction_handle)
                 result.add_deleted(delete_uri)
             except Exception as e:
                 tracer.error(f"Failed to delete memory {delete_uri}", e)
@@ -1419,7 +1426,7 @@ class MemoryUpdater:
             )
             return result
 
-        await self._sync_resource_refs_for_result(result, ctx)
+        await self._sync_resource_refs_for_result(result, ctx, lease_ref=self._transaction_handle)
 
         # Vectorize written and edited memories
         uri_memory_type_map = {}
@@ -1451,7 +1458,13 @@ class MemoryUpdater:
             )
 
         for dir, memory_type in dirs.items():
-            await self.generate_overview(memory_type, dir, ctx, extract_context)
+            await self.generate_overview(
+                memory_type,
+                dir,
+                ctx,
+                extract_context,
+                lease_ref=self._transaction_handle,
+            )
 
         return result
 
@@ -1491,7 +1504,7 @@ class MemoryUpdater:
                         uri,
                         snapshot.content,
                         ctx=ctx,
-                        lock_handle=self._transaction_handle,
+                        lease_ref=self._transaction_handle,
                     )
                     readback = await viking_fs.read_file(uri, ctx=ctx)
                     if readback != snapshot.content:
@@ -1504,7 +1517,7 @@ class MemoryUpdater:
                             uri,
                             recursive=False,
                             ctx=ctx,
-                            lock_handle=self._transaction_handle,
+                            lease_ref=self._transaction_handle,
                         )
                     except NotFoundError:
                         pass
@@ -1522,6 +1535,7 @@ class MemoryUpdater:
         self,
         result: MemoryUpdateResult,
         ctx: RequestContext,
+        lease_ref: Any = None,
     ) -> None:
         """Synchronize resource refs for memory files touched by session extraction."""
         viking_fs = self._get_viking_fs()
@@ -1545,13 +1559,17 @@ class MemoryUpdater:
                         uri,
                         MemoryFileUtils.write(mf),
                         ctx=ctx,
-                        lock_handle=self._transaction_handle,
+                        lease_ref=lease_ref,
                     )
             except Exception as exc:
                 logger.warning("Failed to sync resource refs for %s: %s", uri, exc)
 
     async def _apply_upsert(
-        self, resolved_op: ResolvedOperation, ctx: RequestContext, extract_context: Any = None
+        self,
+        resolved_op: ResolvedOperation,
+        ctx: RequestContext,
+        extract_context: Any = None,
+        lease_ref: Any = None,
     ):
         """Apply upsert operation from a flat model."""
         viking_fs = self._get_viking_fs()
@@ -1714,7 +1732,7 @@ class MemoryUpdater:
                 uri,
                 new_full_content,
                 ctx=ctx,
-                lock_handle=self._transaction_handle,
+                lease_ref=lease_ref,
             )
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
@@ -1973,7 +1991,7 @@ class MemoryUpdater:
                 viking_fs,
                 skip_uris=skip,
                 preserve_version_uris=upserted_uris if include_upserted else set(),
-                lock_handle=self._transaction_handle,
+                lease_ref=self._transaction_handle,
             )
         except _LinkPublicationError as error:
             tracer.error(f"Deferred link publication failed: {error}")
@@ -1983,7 +2001,6 @@ class MemoryUpdater:
             if uri not in upserted_uris and uri not in result.edited_uris:
                 result.add_edited(uri)
         return True
-
 
     async def _inherit_deleted_link_relations(
         self,
@@ -2052,7 +2069,7 @@ class MemoryUpdater:
                 viking_fs,
                 skip_uris=set(uri_remap),
                 preserve_version_uris=written_or_edited,
-                lock_handle=self._transaction_handle,
+                lease_ref=self._transaction_handle,
             )
         except _LinkPublicationError as error:
             tracer.error(f"Failed to inherit replacement links: {error}")
@@ -2063,16 +2080,19 @@ class MemoryUpdater:
                 result.add_edited(uri)
         return True
 
-    async def _apply_delete(self, uri: str, ctx: RequestContext) -> None:
+    async def _apply_delete(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        lease_ref: Any = None,
+    ) -> None:
         """Apply delete operation (uri is already a string)."""
         viking_fs = self._get_viking_fs()
 
         # Delete from VikingFS
-        # VikingFS automatically handles vector index cleanup
-        # Pass transaction_handle so rm() reuses the compressor's tree lock
-        # instead of trying to acquire a new lock (which would conflict).
+        # VikingFS automatically handles vector index cleanup.
         try:
-            await viking_fs.rm(uri, recursive=False, ctx=ctx, lock_handle=self._transaction_handle)
+            await viking_fs.rm(uri, recursive=False, ctx=ctx, lease_ref=lease_ref)
         except NotFoundError:
             tracer.error(f"Memory not found for delete: {uri}")
             # Idempotent - deleting non-existent file succeeds
@@ -2234,6 +2254,7 @@ class MemoryUpdater:
         directory: str,
         ctx: RequestContext,
         extract_context: Any = None,
+        lease_ref: Any = None,
     ) -> None:
         """
         Generate .overview.md file for a directory based on overview_template.
@@ -2290,7 +2311,7 @@ class MemoryUpdater:
                     overview_path,
                     recursive=False,
                     ctx=ctx,
-                    lock_handle=self._transaction_handle,
+                    lease_ref=lease_ref,
                 )
             except Exception:
                 pass
@@ -2301,7 +2322,7 @@ class MemoryUpdater:
                         directory,
                         recursive=True,
                         ctx=ctx,
-                        lock_handle=self._transaction_handle,
+                        lease_ref=lease_ref,
                     )
                 except Exception:
                     pass
@@ -2356,7 +2377,7 @@ class MemoryUpdater:
                 overview_path,
                 rendered,
                 ctx=ctx,
-                lock_handle=self._transaction_handle,
+                lease_ref=lease_ref,
             )
         except Exception as e:
             tracer.error(f"Failed to write overview {overview_path}: {e}")

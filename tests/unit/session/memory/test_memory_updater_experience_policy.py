@@ -463,8 +463,10 @@ async def test_failed_declared_provenance_endpoint_rolls_back_successful_experie
     )
     updater._viking_fs = fs
 
-    async def write_experience_then_fail_trajectory(operation, ctx, extract_context=None):
-        del ctx, extract_context
+    async def write_experience_then_fail_trajectory(
+        operation, ctx, extract_context=None, lease_ref=None
+    ):
+        del ctx, extract_context, lease_ref
         uri = operation.uris[0]
         if operation.memory_type != "experiences":
             raise RuntimeError("injected trajectory write failure")
@@ -552,8 +554,8 @@ async def test_deleted_provenance_endpoint_rolls_back_experience_before_derived_
     )
     updater._viking_fs = fs
 
-    async def write_experience(operation, ctx, extract_context=None):
-        del ctx, extract_context
+    async def write_experience(operation, ctx, extract_context=None, lease_ref=None):
+        del ctx, extract_context, lease_ref
         memory_file = MemoryFile(
             uri=experience_uri,
             content=operation.memory_fields["content"],
@@ -618,8 +620,8 @@ async def test_experience_content_failure_deletes_every_new_attempt_before_refs(
     )
     updater._viking_fs = fs
 
-    async def write_then_fail_second(operation, ctx, extract_context=None):
-        del ctx, extract_context
+    async def write_then_fail_second(operation, ctx, extract_context=None, lease_ref=None):
+        del ctx, extract_context, lease_ref
         uri = operation.uris[0]
         memory_file = MemoryFile(
             uri=uri,
@@ -692,8 +694,8 @@ async def test_experience_content_failure_restores_existing_blob_exactly(monkeyp
     )
     updater._viking_fs = fs
 
-    async def overwrite_then_fail(operation, ctx, extract_context=None):
-        del operation, ctx, extract_context
+    async def overwrite_then_fail(operation, ctx, extract_context=None, lease_ref=None):
+        del operation, ctx, extract_context, lease_ref
         changed = MemoryFile(
             uri=uri,
             content=VALID_CONTENT.replace(

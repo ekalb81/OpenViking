@@ -31,6 +31,7 @@ from .parser_config import (
     AudioConfig,
     CodeConfig,
     DirectoryConfig,
+    ExcelConfig,
     FeishuConfig,
     HTMLConfig,
     ImageConfig,
@@ -205,6 +206,14 @@ class OpenVikingConfig(BaseModel):
         default_factory=MarkdownConfig, description="Markdown parsing configuration"
     )
 
+    excel: ExcelConfig = Field(
+        # from_dict on an empty mapping, not the bare constructor: an absent
+        # parsers.excel section must record that no key was set, so sectioning
+        # still follows parsers.markdown for deployments predating this section.
+        default_factory=lambda: ExcelConfig.from_dict({}),
+        description="Excel parsing configuration",
+    )
+
     html: HTMLConfig = Field(default_factory=HTMLConfig, description="HTML parsing configuration")
 
     text: TextConfig = Field(default_factory=TextConfig, description="Text parsing configuration")
@@ -236,6 +245,15 @@ class OpenVikingConfig(BaseModel):
     connector: ConnectorConfig = Field(
         default_factory=ConnectorConfig,
         description="External Connector service configuration for data import",
+    )
+
+    enable_watch_scheduler: bool = Field(
+        default=True,
+        description=(
+            "Whether to start the background WatchScheduler that periodically re-processes "
+            "watched resources. Disable on read-only replicas that share a writer's data "
+            "so only the writer runs the watch/refresh background loop."
+        ),
     )
 
     auto_generate_l0: bool = Field(
@@ -379,6 +397,7 @@ class OpenVikingConfig(BaseModel):
                 "audio",
                 "video",
                 "markdown",
+                "excel",
                 "html",
                 "text",
                 "directory",

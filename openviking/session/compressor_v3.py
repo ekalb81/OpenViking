@@ -93,6 +93,7 @@ _TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
 _TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
 _TRAINING_FAST_PATH_MEMORY_TYPES = frozenset({"cases", "trajectories", "experiences"})
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_EXPERIENCE_TRAJECTORY_MAP_PREFIX = "OpenViking-Experience-Trajectory-Map: "
 
 
 async def _commit_experience_snapshot(
@@ -101,21 +102,33 @@ async def _commit_experience_snapshot(
     ctx: RequestContext,
     experience_uris: list[str],
     archive_uri: str = "",
+    experience_trajectory_map: Optional[dict[str, list[str]]] = None,
 ) -> None:
     commit = getattr(viking_fs, "commit", None)
     if not callable(commit):
         return
-    paths = [
-        uri
+    has_experience_changes = any(
+        "/memories/experiences/" in uri and uri.endswith(".md")
         for uri in dict.fromkeys(str(uri or "") for uri in experience_uris)
-        if "/memories/experiences/" in uri and uri.endswith(".md")
-    ]
-    if not paths:
+    )
+    if not has_experience_changes:
         return
-    archive_name = archive_uri.rstrip("/").rsplit("/", 1)[-1] if archive_uri else "unknown"
+    paths = [_experience_root_uri(ctx)]
+    archive_ref = archive_uri.rstrip("/") if archive_uri else "unknown"
+    changed_experience_uris = set(dict.fromkeys(str(uri or "") for uri in experience_uris))
+    trajectory_map = {
+        experience_uri: list(dict.fromkeys(trajectory_uris))
+        for experience_uri, trajectory_uris in (experience_trajectory_map or {}).items()
+        if experience_uri in changed_experience_uris
+    }
+    message = (
+        f"Update experience memories from session commit {archive_ref}\n"
+        f"{_EXPERIENCE_TRAJECTORY_MAP_PREFIX}"
+        f"{json.dumps(trajectory_map, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+    )
     try:
         await commit(
-            message=f"Update experience memories from session commit {archive_name}",
+            message=message,
             paths=paths,
             ctx=ctx,
         )
@@ -192,7 +205,6 @@ class SessionCompressorV3:
         return MemoryUpdater(
             registry=registry,
             vikingdb=self.vikingdb,
-            transaction_handle=transaction_handle,
         )
 
     async def _build_memory_diff(
@@ -883,10 +895,50 @@ class SessionCompressorV3:
                     policy_set=exp_trainer.policy_set,
                 )
                 if exp_gradients:
+                    fallback_trajectory_uris = {
+                        uri
+                        for trajectory in analysis.trajectories
+                        if (uri := str(getattr(trajectory, "uri", "") or ""))
+                    }
+
+                    async def commit_experience_batch(
+                        batch_result: RolloutTrainingResult,
+                        *,
+                        _fallback_trajectory_uris: set[str] = fallback_trajectory_uris,
+                    ) -> None:
+                        snapshot_apply_result, experience_trajectory_map = (
+                            _experience_snapshot_provenance(
+                                batch_result,
+                                fallback_trajectory_uris=_fallback_trajectory_uris,
+                            )
+                        )
+                        apply_errors = list(getattr(snapshot_apply_result, "errors", []) or [])
+                        if apply_errors:
+                            # A failed apply leaves experience bodies restored or removed
+                            # and withholds refs and vector publication, so committing the
+                            # snapshot would advertise memory that was never published.
+                            logger.warning(
+                                "Experience update was not committed because apply "
+                                "reported %d error(s)",
+                                len(apply_errors),
+                            )
+                            return
+                        await _commit_experience_snapshot(
+                            viking_fs,
+                            ctx=ctx,
+                            experience_uris=[
+                                *list(getattr(snapshot_apply_result, "written_uris", []) or []),
+                                *list(getattr(snapshot_apply_result, "deleted_uris", []) or []),
+                            ],
+                            archive_uri=archive_uri,
+                            experience_trajectory_map=experience_trajectory_map,
+                        )
+
                     exp_training_result = await exp_trainer.submit_gradients(
                         exp_gradients,
                         analysis=analysis,
                         rollout=rollout,
+                        batch_finalizer=commit_experience_batch,
                     )
                 if case_uri:
                     await self._link_case_to_training_outputs(
@@ -897,28 +949,12 @@ class SessionCompressorV3:
                         ctx=ctx,
                         viking_fs=viking_fs,
                     )
+                # The snapshot commit itself now happens in commit_experience_batch;
+                # this only decides whether the case counts as submitted.
                 exp_apply_result = getattr(exp_training_result, "apply_result", None)
-                exp_apply_errors = (
-                    list(getattr(exp_apply_result, "errors", []) or [])
-                    if exp_apply_result is not None
-                    else []
+                exp_apply_succeeded = exp_apply_result is not None and not list(
+                    getattr(exp_apply_result, "errors", []) or []
                 )
-                exp_apply_succeeded = exp_apply_result is not None and not exp_apply_errors
-                if exp_apply_succeeded:
-                    await _commit_experience_snapshot(
-                        viking_fs,
-                        ctx=ctx,
-                        experience_uris=[
-                            *list(getattr(exp_apply_result, "written_uris", []) or []),
-                            *list(getattr(exp_apply_result, "deleted_uris", []) or []),
-                        ],
-                        archive_uri=archive_uri,
-                    )
-                elif exp_apply_errors:
-                    logger.warning(
-                        "Experience update was not committed because apply reported %d error(s)",
-                        len(exp_apply_errors),
-                    )
                 # Skill path: co-extracted skill gradients go directly to skill trainer
                 if skill_trainer is not None and analysis.gradients:
                     skill_gradients = [
@@ -1753,6 +1789,15 @@ def _case_experience_links_via_trajectories(
 
 
 def _plan_item_has_source_trajectory(item: PolicyPlanItem, trajectory_uris: set[str]) -> bool:
+    return bool(_plan_item_source_trajectory_uris(item, trajectory_uris))
+
+
+def _plan_item_source_trajectory_uris(
+    item: PolicyPlanItem,
+    trajectory_uris: set[str],
+) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
     for link in getattr(item, "links", []) or []:
         try:
             stored = link if isinstance(link, StoredLink) else StoredLink(**dict(link))
@@ -1763,8 +1808,66 @@ def _plan_item_has_source_trajectory(item: PolicyPlanItem, trajectory_uris: set[
             and stored.to_uri in trajectory_uris
             and "/memories/trajectories/" in str(stored.to_uri or "")
         ):
-            return True
-    return False
+            uri = str(stored.to_uri)
+            if uri not in seen:
+                seen.add(uri)
+                result.append(uri)
+    return result
+
+
+def _experience_trajectory_map(
+    *,
+    plan: PolicyUpdatePlan,
+    apply_result: PolicyApplyResult,
+    trajectory_uris: set[str],
+) -> dict[str, list[str]]:
+    root_uri = getattr(getattr(apply_result, "updated_policy_set", None), "root_uri", "")
+    if not root_uri:
+        return {}
+    written_uris = set(getattr(apply_result, "written_uris", []) or [])
+    result: dict[str, list[str]] = {}
+    for item in getattr(plan, "items", []) or []:
+        if item.memory_type != "experiences" or item.kind != "upsert":
+            continue
+        experience_uri = _experience_plan_item_uri(item, root_uri)
+        if not experience_uri or experience_uri not in written_uris:
+            continue
+        source_uris = _plan_item_source_trajectory_uris(item, trajectory_uris)
+        if not source_uris:
+            continue
+        existing = result.setdefault(experience_uri, [])
+        existing.extend(uri for uri in source_uris if uri not in existing)
+    return result
+
+
+def _experience_snapshot_provenance(
+    training_result: Any,
+    *,
+    fallback_trajectory_uris: Optional[set[str]] = None,
+) -> tuple[PolicyApplyResult, dict[str, list[str]]]:
+    """Return provenance for the complete update that reached storage.
+
+    Concurrent submitters can share one streaming trainer flush. Their
+    top-level result is scoped to one submitter, while ``batch_result`` owns
+    the complete plan and apply result that were written atomically. Snapshot
+    history must describe that complete persisted update, regardless of which
+    waiter reaches the snapshot commit first.
+    """
+    persisted_result = getattr(training_result, "batch_result", None) or training_result
+    apply_result = persisted_result.apply_result
+    trajectory_uris = {
+        uri
+        for analysis in getattr(persisted_result, "analyses", []) or []
+        for trajectory in getattr(analysis, "trajectories", []) or []
+        if (uri := str(getattr(trajectory, "uri", "") or ""))
+    }
+    if not trajectory_uris:
+        trajectory_uris = set(fallback_trajectory_uris or set())
+    return apply_result, _experience_trajectory_map(
+        plan=persisted_result.plan,
+        apply_result=apply_result,
+        trajectory_uris=trajectory_uris,
+    )
 
 
 def _stored_link(

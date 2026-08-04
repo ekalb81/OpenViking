@@ -64,6 +64,11 @@
         "agfs": {
             "backend": "local",
             "timeout": 10,
+            "pathlock": {
+                "provider": "filesystem",
+                "lock_timeout_secs": 0.0,
+                "lock_expire_secs": 1800.0
+            },
             "s3": {
                 "bucket": null,
                 "region": null,
@@ -108,6 +113,13 @@
         "max_retries": 2,
         "provider": "volcengine",
         "thinking": false,
+        "media": {
+            "enabled": false,
+            "file_processing_timeout": 1800,
+            "file_poll_interval": 3,
+            "max_concurrent": 2,
+            "video_fps": 1.0,
+        },
     },
     "vlm_codex_example": {
         "_comment": "For Codex OAuth via subscription. Complete sign-in from `openviking-server init`. OV stores tokens in ~/.openviking/codex_auth.json and can bootstrap from an existing Codex CLI auth file if needed.",
@@ -211,15 +223,6 @@
             "mineru_timeout": 300.0,
         },
         "code": {
-            "code_summary_mode": "ast",
-            "extract_functions": true,
-            "extract_classes": true,
-            "extract_imports": true,
-            "include_comments": true,
-            "max_line_length": 1000,
-            "max_token_limit": 50000,
-            "truncation_strategy": "head",
-            "warn_on_truncation": true,
             "github_raw_domain": "raw.githubusercontent.com",
             "code_hosting_domains": [
                 "github.com",

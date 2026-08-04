@@ -190,9 +190,7 @@ def _plan_merge_errors(plan: PolicyUpdatePlan) -> list[str]:
     return [str(error) for error in errors or []]
 
 
-def _apply_items_to_snapshot(
-    items: list[PolicyPlanItem], policy_set: PolicySet
-) -> PolicySet:
+def _apply_items_to_snapshot(items: list[PolicyPlanItem], policy_set: PolicySet) -> PolicySet:
     policies_by_uri = {policy.uri: policy for policy in policy_set.policies}
     result = list(policy_set.policies)
 
@@ -285,7 +283,6 @@ def _target_uri(item: PolicyPlanItem, root_uri: str) -> str:
     return f"{root_uri.rstrip('/')}/{_safe_experience_filename(item.target_name)}.md"
 
 
-
 def _plan_to_resolved_operations(
     *,
     plan: PolicyUpdatePlan,
@@ -307,8 +304,7 @@ def _plan_to_resolved_operations(
             != _normalize_guard_content(item.before_content)
         ):
             errors.append(
-                "base content mismatch for "
-                f"{item.target_name}: expected gradient before_content"
+                f"base content mismatch for {item.target_name}: expected gradient before_content"
             )
             continue
 
@@ -328,9 +324,7 @@ def _plan_to_resolved_operations(
 
         updated = _find_policy(updated_policy_set, uri=uri, name=item.target_name)
         if updated is None:
-            errors.append(
-                f"planned policy not found after simulation: {item.target_name}"
-            )
+            errors.append(f"planned policy not found after simulation: {item.target_name}")
             continue
 
         upserts.append(

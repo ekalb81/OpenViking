@@ -51,6 +51,9 @@ def _queue(read_result=None) -> NamedQueue:
     queue.path = "/queue/Semantic"
     queue._async_agfs = _FakeAsyncAGFS(read_result)
     queue._initialized = True
+    # __new__ skips __init__, so the task work index the error path consults
+    # has to be set explicitly.
+    queue._task_work_index = None
     return queue
 
 
